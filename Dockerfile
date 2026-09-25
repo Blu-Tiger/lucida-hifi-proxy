@@ -4,6 +4,10 @@
 # HEADED Chromium (true headless is challenged and fails). A container has no
 # display, so the browser runs under Xvfb. That is why this image installs xvfb
 # and why the entrypoint is `xvfb-run` rather than plain `python`.
+#
+# xauth is required by xvfb-run itself (it creates an auth cookie for the display),
+# and the xvfb package does not pull it in: without it the container exits 3 with
+# "xvfb-run: error: xauth command not found" before Python ever starts.
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -19,7 +23,7 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt \
     && python -m playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends xvfb \
+    && apt-get install -y --no-install-recommends xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 COPY lucidadl/ ./lucidadl/

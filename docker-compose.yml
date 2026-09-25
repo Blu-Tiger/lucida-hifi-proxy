@@ -6,6 +6,10 @@ services:
     image: ghcr.io/blu-tiger/lucida-hifi-proxy:latest
     container_name: lucida-hifi-proxy
     restart: unless-stopped
+    # Chromium is memory-hungry on /dev/shm, and Docker's default is 64 MB, which
+    # makes the browser die mid-page-load in ways that look like Cloudflare
+    # failures. Playwright adds this only for Edge, not Chromium, so set it here.
+    shm_size: "1gb"
     ports:
       - "8002:8002"
     environment:
