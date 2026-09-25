@@ -28,7 +28,7 @@ Read the code before trusting it with anything you care about.
 git clone https://github.com/Blu-Tiger/lucida-hifi-proxy.git
 cd lucida-hifi-proxy
 cp .env.example .env      # then set PROXY_BASE_URL (see below)
-docker compose up -d --build
+docker compose up -d      # pulls ghcr.io/blu-tiger/lucida-hifi-proxy:latest
 ```
 
 Then check it:
@@ -36,6 +36,15 @@ Then check it:
 ```bash
 curl http://localhost:8002/health
 curl "http://localhost:8002/search/?s=creep&limit=3"
+```
+
+There is no build step: compose runs the image published to GHCR, which CI
+builds from the `Dockerfile` on every push to `main`. To update, or to build
+from a checkout instead:
+
+```bash
+docker compose pull && docker compose up -d   # move to the newest published image
+docker build -t ghcr.io/blu-tiger/lucida-hifi-proxy:latest .   # or build your own
 ```
 
 ### Setting `PROXY_BASE_URL`
@@ -126,6 +135,9 @@ These are real and reproduce; they are not hypothetical.
 - **A container needs a virtual display.** lucida.to's Cloudflare check rejects a
   truly headless browser, so the image runs Chromium under Xvfb. Expect it to use
   a few hundred MB of RAM.
+- **The image is published under `:latest` with no versioned tags yet**, so a
+  fresh pull can change behaviour under you. Pushing a `v*` tag makes CI publish
+  a version tag you can pin to instead.
 
 ## Legal
 

@@ -1,5 +1,16 @@
 name: Build and publish image
 
+# Publishes ghcr.io/blu-tiger/lucida-hifi-proxy, which is the image
+# docker-compose.yml runs.
+#
+# FIRST RELEASE ONLY: a GHCR package created by this workflow is PRIVATE even
+# when the repository is public, so pick "Change visibility" -> Public once in the
+# package settings (github.com/users/<owner>/packages/container/<name>/settings).
+# Until then, `docker compose up -d` fails to pull for anyone but you.
+#
+# Note this workflow lowercases the owner because GHCR rejects uppercase image
+# names, and github.repository preserves the owner's casing.
+
 on:
   push:
     branches: [main]

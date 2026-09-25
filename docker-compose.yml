@@ -1,6 +1,8 @@
 services:
   lucida-hifi-proxy:
-    build: .
+    # Prebuilt image, published by .github/workflows/docker.yml on every push to
+    # main. There is deliberately no `build:` here so `docker compose up -d` just
+    # pulls it — see the README for building your own image instead.
     image: ghcr.io/blu-tiger/lucida-hifi-proxy:latest
     container_name: lucida-hifi-proxy
     restart: unless-stopped
