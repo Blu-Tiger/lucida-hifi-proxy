@@ -71,13 +71,37 @@ should show up as able to download.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PROXY_BASE_URL` | `http://host.docker.internal:8002` | Address clients use to reach this proxy. |
-| `LUCIDA_SERVICE` | `qobuz` | lucida.to service to search. |
-| `LUCIDA_COUNTRY` | `US` | Country lucida.to reports results for. |
+| `LUCIDA_SERVICE` | `qobuz` | lucida.to service to search. The services lucida.to itself offers are `qobuz`, `tidal`, `soundcloud`, `deezer`, `amazon`, `yandex` and `grilledcheese` (there is no `spotify` — it has been removed). Any other value is tried first but reported as an error at startup and in `/health`. |
+| `LUCIDA_COUNTRY` | `US` | Country used when fetching item pages and starting downloads. Search does **not** use this: each service accepts only specific countries, so search uses a per-service table (see below). |
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8002` | Bind address. |
 | `LUCIDA_USER_AGENT` | a Chrome UA | User agent used for lucida.to. |
 | `LUCIDA_PROBE_QUERY` | `test` | Query used to attach a real track to the client's probe id. |
 | `DOWNLOAD_DIR` | `/data/downloads` | Where downloaded audio is cached. Used verbatim when set. |
 | `LUCIDADL_HOME` | `/data` | Cloudflare cookie + browser profile location. |
+
+`GET /health` reports the resolved `backend_service`, whether
+`backend_service_known` is true, the `known_services` list, the
+`fallback_order`, and the `service_country` table — so a misspelled
+`LUCIDA_SERVICE` or a wrong country is one request away instead of buried in a
+log.
+
+### Search countries are per service
+
+lucida.to rejects any country a service does not accept with a bare
+`Invalid country for X`, and the accepted set differs per service. Sending one
+country for everything silently disables most services:
+
+| Service | Country sent |
+| --- | --- |
+| `qobuz` | `US` (the only value it accepts) |
+| `soundcloud`, `grilledcheese` | `XX` (the only value they accept) |
+| `amazon` | `US` (it accepts 48 countries) |
+| `tidal`, `deezer`, `yandex` | none found that works |
+
+lucidadl ships the wrong table — it sends `US` for every service it does not
+know, which makes SoundCloud and GrilledCheese fail every single search. The
+proxy corrects this at import time (`SERVICE_COUNTRY`), so the fix survives
+upgrading lucidadl rather than living in the vendored copy.
 
 `/data` is a volume in the compose file, so the Cloudflare clearance, browser
 profile and download cache survive restarts. Keeping the clearance is worth it:
@@ -118,11 +142,25 @@ These are real and reproduce; they are not hypothetical.
 - **`/album/` can never list tracks.** Search returns tracks only, and a track's
   album id is derived from the album *title*, so the album has no lucida URL to
   fetch. The route returns a valid but empty track list.
-- **Search depends on lucida.to's own service health.** Amazon search currently
-  fails with a backend `ENOENT` and Spotify is disabled upstream, which is why
-  the default is `qobuz`. The proxy fails over between services, and returns
-  **502 with the reason** when *no* service answers — a query that genuinely
-  matched nothing still returns 200 with zero items.
+- **Search depends on lucida.to's own service health, which changes.** Measured
+  in one session: `qobuz` broke mid-session with an upstream 403 after working
+  repeatedly, `amazon` fails every search on a backend `ENOENT`,
+  `yandex` reports itself disabled, and `tidal`/`deezer` reject every country we
+  could find. `grilledcheese` and `soundcloud` answered throughout. Because this
+  moves, the proxy tries `LUCIDA_SERVICE`, then falls back, and returns
+  **502 naming every service that failed** only when *no* service answers — a
+  query that genuinely matched nothing still returns 200 with zero items.
+
+  A failing fallback logs at `INFO` and a failing *configured* service logs at
+  `WARNING`; only a search no service answered logs at `ERROR`. So a healthy
+  search is quiet, and a `WARNING ... failed on qobuz` line is the one to read.
+- **Falling back can change what you get.** Fallbacks are ordered lossless
+  first, but they are different libraries: `soundcloud` returns lossy audio and
+  puts the *uploader* in the artist field (`Radiohead - Creep` / `deathismercy`),
+  where `qobuz` and `grilledcheese` return FLAC. If a result looks wrong or
+  sounds lossy, the search was served by a fallback. `grilledcheese` is an
+  official lucida.to service, but it is served by a third party whose catalogue
+  and reliability are not yours to control.
 - **Some queries make lucida.to error out** server-side
   (`Cannot read properties of undefined (reading 'name')`) on every service.
   Those searches return 502.

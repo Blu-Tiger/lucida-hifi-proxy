@@ -49,10 +49,42 @@ from lucidadl.session import acquire_clearance, chromium_installed, install_chro
 
 API_VERSION = "2.10"
 
-# lucida.to service used for keyword search. Defaults to qobuz because lucida.to
-# disables services server-side without notice: Amazon fails every search with a
-# backend ENOENT and Spotify reports itself disabled, while qobuz answers.
+# lucida.to service used for keyword search. Defaults to qobuz because it is
+# the lossless source, which is the point of a HiFi proxy. lucida.to disables
+# services server-side without notice, so availability varies over time.
 SERVICE = os.getenv("LUCIDA_SERVICE", "qobuz")
+
+# Every service lucida.to itself offers, read from the <select id="service"> on
+# its own search page rather than assumed. A name outside this list is still
+# tried first, but it is reported loudly rather than failing quietly.
+# Note there is no `spotify`: it is no longer in the dropdown at all.
+KNOWN_SERVICES = (
+    "amazon", "deezer", "grilledcheese", "qobuz", "soundcloud", "tidal", "yandex",
+)
+
+# Country to search each service with, or "" to send none. lucida.to rejects any
+# country a service does not accept with a plain "Invalid country for X", and
+# the accepted set differs per service - it is NOT one global country. Measured
+# 2026-09 against lucida.to's own <select id="country">:
+#   qobuz     US only
+#   amazon    48 countries (US is one); its search backend is broken separately
+#   soundcloud, grilledcheese   XX only
+#   tidal, deezer, yandex      no country we could find that works
+SERVICE_COUNTRY = {
+    "qobuz": "US",
+    "soundcloud": "XX",
+    "grilledcheese": "XX",
+    "amazon": "US",
+}
+
+# Fallback order for a HiFi proxy, so lossless sources are preferred and lossy
+# ones are a last resort: qobuz and grilledcheese both returned verified FLAC,
+# while soundcloud serves lossy audio and reports the uploader as the artist.
+# amazon (backend ENOENT), yandex ("currently disabled") and tidal/deezer are
+# left out because each was measured to fail every search, and retrying a dead
+# service costs a wasted upstream round-trip on every search. Set LUCIDA_SERVICE
+# to one of them explicitly to use it anyway.
+FALLBACK_SERVICES = ("qobuz", "grilledcheese", "soundcloud")
 COUNTRY = os.getenv("LUCIDA_COUNTRY", "US")
 USER_AGENT = os.getenv(
     "LUCIDA_USER_AGENT",
@@ -84,6 +116,47 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("lucida-proxy")
+
+_unknown_service_reported = False
+
+
+def resolved_service() -> str:
+    """Configured lucida.to service, with a one-time report if it is unrecognized.
+
+    A typo in LUCIDA_SERVICE is otherwise invisible: the value is tried first,
+    fails, and the proxy answers from a fallback service while the error text
+    names whichever service happened to fail last. Unknown names are still
+    honoured, because lucida.to adds and retires services without notice.
+    """
+    global _unknown_service_reported
+
+    name = str(SERVICE).strip().lower()
+    if name not in KNOWN_SERVICES and not _unknown_service_reported:
+        _unknown_service_reported = True
+        logger.error(
+            "LUCIDA_SERVICE=%r is not a service this proxy recognizes (%s). "
+            "It will still be tried first, and search will fall back to another "
+            "service if it fails.",
+            SERVICE,
+            ", ".join(KNOWN_SERVICES),
+        )
+    return name
+
+
+def service_country(service: str) -> str:
+    """Country to search `service` with, or "" to send no country param."""
+    return SERVICE_COUNTRY.get(api.normalize_service(service), "")
+
+
+# lucidadl answers "which country?" from a module-level function that
+# `LucidaClient.search` calls directly, and its shipped answers are wrong: it
+# sends US for every service it does not know, but SoundCloud and GrilledCheese
+# accept ONLY XX, so they failed outright with "Invalid country" and read as
+# permanently broken services. Overriding it here rather than editing the
+# vendored copy keeps the correction attached to this proxy, where it survives
+# reinstalling or upgrading lucidadl. Verified live: soundcloud and
+# grilledcheese both return tracks through this path.
+api.default_country = service_country
 
 MEDIA_TYPES = {
     ".flac": "audio/flac",
@@ -252,7 +325,7 @@ class LucidaWrapper:
             )
             await client.start_http()
             self.client = client
-            logger.info("lucidadl client initialized (service=%s)", SERVICE)
+            logger.info("lucidadl client initialized (service=%s)", resolved_service())
 
     async def close(self) -> None:
         client, self.client = self.client, None
@@ -274,32 +347,51 @@ class LucidaWrapper:
         """
         assert self.client is not None
 
-        configured = api.normalize_service(SERVICE)
-        services = [SERVICE] + [s for s in api.FALLBACK_SERVICES
-                                if api.normalize_service(s) != configured]
+        configured = resolved_service()
+        services = [configured] + [s for s in FALLBACK_SERVICES if s != configured]
 
-        last_error: Optional[str] = None
+        # Every failure is kept, not just the last one: reporting only the final
+        # error credits whichever fallback hit a wall last, which points at the
+        # wrong service whenever the configured one is the problem.
+        failures: List[str] = []
         answered = False
+
+        def report(service: str, detail: Any) -> None:
+            """Record a failure, at a level matching how much it matters.
+
+            The configured service failing is a real problem worth a warning. A
+            fallback failing is routine: fallbacks exist precisely because
+            lucida.to services break, and several have stayed broken for good
+            (amazon currently 500s on a missing searchMinimal.graphql), so
+            warning on them made every healthy search look like a failure.
+            """
+            failures.append(f"{service}: {detail}")
+            log = logger.warning if service == configured else logger.info
+            log("lucida search failed on %s: %s", service, detail)
+
         for service in services:
             try:
                 results = await self.client.search(query=query, service=service)
             except Exception as e:
-                last_error = f"{service}: {e}"
-                logger.warning("lucida search errored on %s: %s", service, e)
+                report(service, e)
                 continue
             if results.get("error"):
-                last_error = f"{service}: {results['error']}"
-                logger.warning("lucida search unavailable on %s: %s", service, results["error"])
+                report(service, results["error"])
                 continue
             answered = True
             if results.get("tracks") or results.get("albums"):
-                if service != SERVICE:
+                if service != configured:
                     logger.info("search served by fallback service %s", service)
                 return results
 
         empty: Dict[str, Any] = {"tracks": [], "albums": [], "artists": []}
-        if not answered and last_error:
-            empty["error"] = last_error
+        if not answered and failures:
+            # The one case that genuinely is broken. Logged once, in full, so the
+            # cause is never split across per-service lines.
+            empty["error"] = "; ".join(failures)
+            logger.error(
+                "search %r failed on every service: %s", query, empty["error"]
+            )
         return empty
 
     async def resolve_tracks(self, url: str) -> List[Dict[str, Any]]:
@@ -791,7 +883,17 @@ async def health():
         "lucida_status": "initialized",
         "cached_tracks": len(cache.tracks),
         "cached_albums": len(cache.albums),
-        "backend_service": SERVICE,
+        "backend_service": resolved_service(),
+        # False means LUCIDA_SERVICE is not a name this proxy recognizes, so
+        # search is being answered by a fallback. Reported here so a typo is one
+        # GET /health away instead of buried in a search warning.
+        "backend_service_known": resolved_service() in KNOWN_SERVICES,
+        "known_services": list(KNOWN_SERVICES),
+        "fallback_order": list(FALLBACK_SERVICES),
+        # Which country each service is searched with, or "" for none. Wrong
+        # values here are the difference between a working service and an
+        # "Invalid country for X" failure.
+        "service_country": {s: service_country(s) for s in KNOWN_SERVICES},
     }
 
 
@@ -802,6 +904,14 @@ if __name__ == "__main__":
     logger.info("Starting Lucida.to -> HiFi proxy on %s:%s", host, port)
     logger.info("API docs: http://%s:%s/docs", host, port)
     logger.info("Clients must reach downloads at PROXY_BASE_URL=%s", PROXY_BASE_URL)
+    # Resolved here so an unrecognized service is reported at startup, before the
+    # first search, rather than only as a warning once a search has already failed.
+    logger.info(
+        "Search service: %s (country=%s), then fallbacks %s",
+        resolved_service(),
+        service_country(SERVICE) or "(none)",
+        ", ".join(s for s in FALLBACK_SERVICES if s != resolved_service()) or "(none)",
+    )
     logger.info("Requires: lucidadl installed, playwright + chromium (auto-installed if missing)")
 
     uvicorn.run(app, host=host, port=port)
