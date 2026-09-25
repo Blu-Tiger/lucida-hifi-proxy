@@ -1,0 +1,20 @@
+.git
+.gitignore
+.github
+.venv
+__pycache__
+*.py[cod]
+.freebuff
+.env
+# Runtime state when running outside Docker (see .gitignore).
+data
+*.log
+# Docs are not needed at runtime. These are root-only paths so that the vendored
+# package keeps its own license file (lucidadl/LICENSE) inside the image: the
+# image is a redistribution, so that MIT notice has to travel with it.
+/README.md
+/THIRD_PARTY_NOTICES.md
+/LICENSE
+Dockerfile
+docker-compose.yml
+.dockerignore

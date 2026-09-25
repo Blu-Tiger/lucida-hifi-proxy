@@ -1,0 +1,30 @@
+services:
+  lucida-hifi-proxy:
+    build: .
+    image: ghcr.io/blu-tiger/lucida-hifi-proxy:latest
+    container_name: lucida-hifi-proxy
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      # The address your SoulSync instance uses to reach this proxy. Set it to
+      # the LAN IP of the host running this container when SoulSync runs on a
+      # different machine, or to host.docker.internal when it runs on this one.
+      PROXY_BASE_URL: ${PROXY_BASE_URL:-http://host.docker.internal:8002}
+
+      # lucida.to service used for search. qobuz works; amazon currently fails
+      # server-side and spotify is disabled upstream.
+      LUCIDA_SERVICE: ${LUCIDA_SERVICE:-qobuz}
+      LUCIDA_COUNTRY: ${LUCIDA_COUNTRY:-US}
+
+      API_HOST: 0.0.0.0
+      API_PORT: 8002
+    volumes:
+      # Cloudflare cookie, browser profile and download cache survive restarts.
+      - lucida-data:/data
+    extra_hosts:
+      # Lets PROXY_BASE_URL use host.docker.internal on Linux too.
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  lucida-data:

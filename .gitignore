@@ -1,0 +1,14 @@
+# Local environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets / local config
+.env
+
+# Freebuff session metadata
+.freebuff/
+
+# Runtime data when running outside Docker
+data/
+*.log
