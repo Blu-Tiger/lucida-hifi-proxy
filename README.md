@@ -3,7 +3,7 @@
 A small HTTP proxy that exposes the [HiFi API](https://github.com/binimum/hifi-api)
 surface — the one [SoulSync](https://github.com/Nezreka/SoulSync) speaks for its
 "HiFi" download source — but serves the audio from
-lucida.to instead of Tidal. No Tidal account required.
+lucida.to.
 
 Point SoulSync's HiFi source at this proxy instead of a public HiFi instance.
 
