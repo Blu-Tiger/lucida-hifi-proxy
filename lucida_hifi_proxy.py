@@ -16,10 +16,21 @@ core/hifi_client.py):
     health-probe id, before any search has populated the cache.
   * The HLS playlist holds ONE segment: the whole audio file. Clients fetch the
     playlist, then GET that segment and write the bytes straight to disk.
+  * The instance URL is pasted, not parsed: every call is built as
+    `url = f"{instance}{path}"` with no urljoin or host normalisation, so a
+    path prefix like `http://host:8002/qobuz` reaches the prefixed routes as
+    `http://host:8002/qobuz/search/`. That is what makes the whole
+    per-service routing below possible without touching the client.
+
+Per-service routing: every route is mounted three times - bare, under
+`/{service}`, and under `/{service}/{country}` - so `http://localhost:8002/qobuz`
+is a usable SoulSync instance pinned to one lucida.to service, and
+`http://localhost:8002/qobuz/GB` additionally pins the search country.
 
 Ownership: `MetadataCache` owns the client-facing id space, `LucidaWrapper`
-owns every lucida.to call, and the routes own the HTTP contract (status codes,
-response shapes, and the error/no-match policy).
+owns every lucida.to call, `Target` owns which service/country a request is
+for, and the routes own the HTTP contract (status codes, response shapes, and
+the error/no-match policy).
 """
 
 import asyncio
@@ -32,12 +43,13 @@ import tempfile
 from base64 import b64encode
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -98,6 +110,12 @@ _country_lock = asyncio.Lock()
 # service costs a wasted upstream round-trip on every search. Set LUCIDA_SERVICE
 # to one of them explicitly to use it anyway.
 FALLBACK_SERVICES = ("qobuz", "grilledcheese", "soundcloud")
+# Whether a request that arrived under a /{service} prefix may fall back to
+# another service when the pinned one is broken. Off by default: a prefix is an
+# explicit pin, and quietly answering from a different service would defeat it -
+# it is also exactly what SoulSync's own instance rotation already does, one
+# layer up, when the whole instance fails. Set to 1 to opt back in.
+PATH_FALLBACK = os.getenv("LUCIDA_PATH_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
 # Account/country to resolve item pages and start downloads with. Empty by
 # default, which sends the literal "auto" in the load request and lets lucida
 # pick the account. A specific value is not rejected, but the item route was
@@ -172,6 +190,115 @@ def service_country(service: str) -> str:
     if known:
         return known[0]
     return BOOTSTRAP_COUNTRY.get(name, "")
+
+
+# ---------------------------------------------------------------------------
+# Per-request service/country target
+#
+# A request's path prefix decides which lucida.to service it searches: `/qobuz`
+# pins qobuz, `/qobuz/GB` pins qobuz and the search country, and a bare
+# `/search/` keeps the LUCIDA_SERVICE + fallback behaviour it always had.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Target:
+    """Which service (and country) one request is for.
+
+    `prefix` is echoed back into every manifest URL this request produces, which
+    is what carries the pin from the search that found a track all the way
+    through to the download that fetches it.
+    """
+
+    service: str
+    country: str
+    prefix: str
+    pinned: bool
+
+    def base_url(self) -> str:
+        """Absolute base for URLs this request hands back to the client."""
+        return PROXY_BASE_URL + self.prefix
+
+
+def validate_service(raw: str) -> str:
+    """Normalize a service name from the path, or reject it.
+
+    Rejecting is deliberate. A misspelled service otherwise fails quietly: it is
+    tried, fails, and the request is answered from a fallback, so the client
+    gets plausible results from a service nobody asked for and the error text
+    names whichever service happened to fail last.
+    """
+    name = api.normalize_service(str(raw).strip().lower())
+    if name not in KNOWN_SERVICES:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"unknown lucida service {raw!r}; known services are "
+                + ", ".join(KNOWN_SERVICES)
+                + ". Omit the path prefix entirely to use LUCIDA_SERVICE"
+                f" ({resolved_service()})."
+            ),
+        )
+    return name
+
+
+def validate_country(service: str, raw: str) -> str:
+    """Normalize a country from the path, or reject it.
+
+    Two checks, in order. The shape check exists because the /{service}/{country}
+    mount will happily match ANY second path segment, so without it a mistyped
+    endpoint like /qobuz/health/ lands in the country slot and is answered with
+    a cheerful instance-root payload instead of a 404. lucida's countries are
+    ISO alpha-2 codes plus its own XX sentinel, so 2-3 letters covers every
+    value it has ever reported.
+
+    The membership check only applies once lucida has actually reported that
+    service's accepted set. Before the first search it is empty and anything
+    of the right shape passes, because the accepted list is learned from lucida
+    rather than guessed - which is the entire point of not hardcoding it.
+    """
+    code = str(raw).strip().upper()
+    if not code.isalpha() or not 2 <= len(code) <= 3:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{raw!r} is not a country code, so it is not a valid second path "
+                f"segment. Use /{service} alone, or /{service}/<country> with an "
+                "ISO country code (lucida also uses XX as its own sentinel)."
+            ),
+        )
+    accepted = _country_by_service.get(service) or []
+    if accepted and code not in accepted:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"lucida does not accept country {code!r} for {service}; it "
+                "accepts " + ", ".join(accepted[:24])
+                + ("..." if len(accepted) > 24 else "")
+                + f". {service} is searched with {service_country(service)!r} "
+                "when the country is omitted."
+            ),
+        )
+    return code
+
+
+def resolve_target(request: Request) -> Target:
+    """Read the service/country this request is for off its path prefix.
+
+    One handler serves all three mounts, so this is the single place the prefix
+    is interpreted. On a bare route both path params are simply absent and the
+    request falls back to the configured service.
+    """
+    raw_service = request.path_params.get("service")
+    raw_country = request.path_params.get("country")
+
+    if not raw_service:
+        return Target(service=resolved_service(), country="", prefix="", pinned=False)
+
+    service = validate_service(raw_service)
+    country = validate_country(service, raw_country) if raw_country else ""
+    prefix = f"/{service}" + (f"/{country}" if country else "")
+    return Target(service=service, country=country, prefix=prefix, pinned=True)
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +507,12 @@ class MetadataCache:
         self.tracks: LRUDict = LRUDict(maxsize)
         self.albums: LRUDict = LRUDict(maxsize)
         self.artists: LRUDict = LRUDict(maxsize)
+        # Probe id -> the record it was materialised from, keyed by the service
+        # that search ran against. Keyed by service because one global alias
+        # would let /soundcloud's capability probe be answered with a Qobuz
+        # track, and the probe decides whether a client thinks this instance can
+        # download at all.
+        self.probes: Dict[str, int] = {}
 
     @staticmethod
     def id_for(key: str) -> int:
@@ -467,13 +600,26 @@ class MetadataCache:
         self.artists[artist_id] = record
         return record
 
-    def alias(self, alias_id: int, record: Dict[str, Any]) -> None:
-        """Serve an existing record under an extra id (the client's probe id)."""
-        self.tracks[alias_id] = record
+    def alias(self, service: str, record: Dict[str, Any]) -> None:
+        """Point the client's probe id at `record`, for `service` only.
 
-    def track(self, raw_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        Re-materialised per service rather than cached once: the probe asks
+        "can this service download anything", and answering it with another
+        service's track would say yes for a source that cannot.
+        """
+        self.probes[api.normalize_service(service)] = int(record["id"])
+
+    def track(self, raw_id: Optional[str], service: str = "") -> Optional[Dict[str, Any]]:
+        """A track record by id, resolving the probe id against `service`."""
         track_id = parse_id(raw_id)
-        return self.tracks.get(track_id) if track_id is not None else None
+        if track_id is None:
+            return None
+        if track_id == SOULSYNC_PROBE_ID and service:
+            aliased = self.probes.get(api.normalize_service(service))
+            if aliased is None:
+                return None
+            track_id = aliased
+        return self.tracks.get(track_id)
 
     def album(self, raw_id: Optional[str]) -> Optional[Dict[str, Any]]:
         album_id = parse_id(raw_id)
@@ -603,18 +749,32 @@ class LucidaWrapper:
                 "using %r instead", stale, name, codes[0])
         return codes
 
-    async def search(self, query: str) -> Dict[str, Any]:
-        """Search, failing over when a service is broken upstream.
+    async def search(self, query: str, target: Target) -> Dict[str, Any]:
+        """Search `target`'s service, failing over when a service is broken upstream.
 
         A broken service still answers HTTP 200, so a single-service search can
         only ever return "nothing". An empty result from a service that DID
         answer is reported as a plain empty result; an error is reported as an
         error only when no service answered at all.
+
+        A pinned target (one that arrived under a /{service} prefix) searches
+        only that service unless LUCIDA_PATH_FALLBACK says otherwise: answering
+        a pinned request from a fallback would hand back a different library's
+        audio under the name of the one that was asked for, which is the whole
+        thing the prefix exists to prevent.
         """
         assert self.client is not None
 
-        configured = resolved_service()
-        services = [configured] + [s for s in FALLBACK_SERVICES if s != configured]
+        configured = target.service
+        services = [configured] + (
+            [s for s in FALLBACK_SERVICES if s != configured]
+            if PATH_FALLBACK or not target.pinned
+            else []
+        )
+        # The pinned country is used as given, even when it is not the one
+        # discovery would have picked - it was asked for explicitly. Without
+        # one, fall back to whatever lucida says this service accepts.
+        country = target.country or service_country(configured)
 
         # Every failure is kept, not just the last one: reporting only the final
         # error credits whichever fallback hit a wall last, which points at the
@@ -637,9 +797,11 @@ class LucidaWrapper:
 
         for service in services:
             # Learn the accepted country first, then search with it. Both are
-            # cached, so a service only pays for discovery once.
+            # cached, so a service only pays for discovery once. Only the pinned
+            # service gets the pinned country; a fallback has to use its own.
             await self.discover_countries(service)
-            node = await self.raw_search(service, service_country(service), query)
+            search_country = country if service == configured else service_country(service)
+            node = await self.raw_search(service, search_country, query)
             if node is None:
                 report(service, "no data node in response (Cloudflare challenge?)")
                 continue
@@ -662,6 +824,10 @@ class LucidaWrapper:
                 "search %r failed on every service: %s", query, empty["error"]
             )
         return empty
+
+    async def probe_search(self, target: Target) -> Dict[str, Any]:
+        """The health-probe query, pinned to the same service as the probe caller."""
+        return await self.search(PROBE_QUERY, target)
 
     async def resolve_tracks(self, url: str) -> List[Dict[str, Any]]:
         """Fetch an item page and return its download-available tracks.
@@ -832,18 +998,30 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-async def root():
+# Every route lives on one router, mounted three times below: bare, under
+# /{service}, and under /{service}/{country}. Handlers read their service and
+# country off the path via `resolve_target`, so one implementation serves all
+# three mounts and cannot drift between them.
+router = APIRouter()
+
+
+@router.get("/")
+async def root(target: Target = Depends(resolve_target)):
     """Always 200, so clients probe capabilities instead of treating a
-    lazily-initialised backend as an offline instance."""
+    lazily-initialised backend as an offline instance.
+
+    Echoes the resolved service so a client aimed at /qobuz can confirm it
+    landed on the service it meant before it searches for anything."""
     return {
         "version": API_VERSION,
         "status": "online" if lucida.client is not None else "starting",
         "Repo": "local lucida.to proxy",
+        "service": target.service,
+        "country": target.country or None,
     }
 
 
-@app.get("/search/")
+@router.get("/search/")
 async def search(
     s: Optional[str] = Query(None, description="Track query"),
     a: Optional[str] = Query(None, description="Artist query"),
@@ -853,6 +1031,7 @@ async def search(
     i: Optional[str] = Query(None, description="ISRC query (unsupported)"),
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=500),
+    target: Target = Depends(resolve_target),
 ):
     """HiFi search. Every documented query field is optional so that clients
     searching by artist or album alone are not answered with a 422."""
@@ -866,15 +1045,16 @@ async def search(
         return hifi({"limit": limit, "offset": offset, "totalNumberOfItems": 0, "items": []})
 
     try:
-        results = await lucida.search(query)
+        results = await lucida.search(query, target)
     except Exception as e:
-        logger.exception("Search failed for query %r", query)
+        logger.exception("Search failed for query %r on %s", query, target.service)
         raise HTTPException(status_code=502, detail=f"lucida search failed: {e}")
 
     # A service-level failure is not "no matches": tell the caller why instead
     # of returning an empty list that looks like a successful empty search.
     if results.get("error") and not (results.get("tracks") or results.get("albums")):
-        logger.warning("Search %r unavailable: %s", query, results["error"])
+        logger.warning("Search %r unavailable on %s: %s",
+                       query, target.service, results["error"])
         raise HTTPException(status_code=502, detail=f"lucida search failed: {results['error']}")
 
     for album in results.get("albums", []):
@@ -899,18 +1079,19 @@ async def search(
     })
 
 
-@app.get("/info/")
-async def info(id: str = Query(...)):
+@router.get("/info/")
+async def info(id: str = Query(...), target: Target = Depends(resolve_target)):
     """Track detail."""
-    record = cache.track(id)
+    record = cache.track(id, target.service)
     return hifi(record) if record is not None else hifi({})
 
 
-@app.get("/album/")
+@router.get("/album/")
 async def album(
     id: str = Query(...),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    target: Target = Depends(resolve_target),
 ):
     """Album detail with its track list.
 
@@ -955,7 +1136,7 @@ async def album(
     })
 
 
-@app.get("/artist/")
+@router.get("/artist/")
 async def artist(id: str = Query(...)):
     """Artist detail. Resolves artists seen in /search/ results as well as those
     learned from a track's artist field."""
@@ -972,18 +1153,27 @@ async def artist(id: str = Query(...)):
 # download routes may search for the health-probe track if it is not cached.
 
 
-def is_servable(raw_id: str) -> bool:
-    """Whether an id resolves without a network call: a cached track, or the
-    client's health-probe id, which downloads lazily."""
-    track_id = parse_id(raw_id)
-    return track_id is not None and (
-        track_id in cache.tracks or track_id == SOULSYNC_PROBE_ID
-    )
+def is_servable(raw_id: str, target: Target) -> bool:
+    """Whether an id resolves without a network call.
+
+    The client's health-probe id counts as servable even before it has been
+    materialised, because the manifest routes are called on a short timeout and
+    must not do a lucida search to answer. Materialising it is the download
+    route's job, which is where a network call is already expected.
+    """
+    if cache.track(raw_id, target.service) is not None:
+        return True
+    return parse_id(raw_id) == SOULSYNC_PROBE_ID
 
 
-async def servable_track(raw_id: str) -> Optional[Dict[str, Any]]:
-    """A client-supplied track id, materialising the probe id on first use."""
-    record = cache.track(raw_id)
+async def servable_track(raw_id: str, target: Target) -> Optional[Dict[str, Any]]:
+    """A client-supplied track id, materialising the probe id on first use.
+
+    The probe search runs against this request's own service, so the id a client
+    is handed proves the service it asked about can download, rather than
+    proving some other service can.
+    """
+    record = cache.track(raw_id, target.service)
     if record is not None:
         return record
     if parse_id(raw_id) != SOULSYNC_PROBE_ID or lucida.client is None:
@@ -992,7 +1182,7 @@ async def servable_track(raw_id: str) -> Optional[Dict[str, Any]]:
     # The client probes with a fixed Tidal id before any search has happened,
     # so point it at a real lucida track for the capability check to pass.
     try:
-        results = await lucida.search(PROBE_QUERY)
+        results = await lucida.probe_search(target)
     except Exception:
         logger.exception("Probe track resolution failed")
         return None
@@ -1000,12 +1190,12 @@ async def servable_track(raw_id: str) -> Optional[Dict[str, Any]]:
         record = cache.put_track(track.get("url", ""), track.get("title", ""),
                                  track.get("artist", ""), track.get("album", ""))
         if record is not None:
-            cache.alias(SOULSYNC_PROBE_ID, record)
+            cache.alias(target.service, record)
             return record
     return None
 
 
-@app.get("/trackManifests/")
+@router.get("/trackManifests/")
 async def track_manifests(
     id: str = Query(...),
     formats: Optional[List[str]] = Query(default=None),
@@ -1013,45 +1203,54 @@ async def track_manifests(
     manifestType: str = Query("MPEG_DASH"),
     uriScheme: str = Query("HTTPS"),
     usage: str = Query("PLAYBACK"),
+    target: Target = Depends(resolve_target),
 ):
     """Only the URI is produced here: the client fetches that playlist and
-    streams its segment, which is where the lucida download actually happens."""
-    if lucida.client is None or not is_servable(id):
+    streams its segment, which is where the lucida download actually happens.
+
+    The URI keeps the request's own prefix, so a track found under /qobuz
+    downloads through /qobuz and not through the bare download route.
+    """
+    if lucida.client is None or not is_servable(id, target):
         logger.warning("trackManifests: unknown track id %r", id)
         return EMPTY_V2_MANIFEST
-    return v2_manifest(f"{PROXY_BASE_URL}/download/manifest/{parse_id(id)}")
+    return v2_manifest(f"{target.base_url()}/download/manifest/{parse_id(id)}")
 
 
-@app.get("/track/")
-async def track_legacy(id: str = Query(...), quality: str = Query("LOSSLESS")):
+@router.get("/track/")
+async def track_legacy(
+    id: str = Query(...),
+    quality: str = Query("LOSSLESS"),
+    target: Target = Depends(resolve_target),
+):
     """Legacy fallback for clients that skip HLS. Its base64 manifest carries
     direct audio URLs, so the client fetches the file itself."""
-    if lucida.client is None or not is_servable(id):
+    if lucida.client is None or not is_servable(id, target):
         logger.warning("track: unknown track id %r", id)
         return EMPTY_LEGACY_MANIFEST
-    return legacy_manifest(f"{PROXY_BASE_URL}/download/track/{parse_id(id)}")
+    return legacy_manifest(f"{target.base_url()}/download/track/{parse_id(id)}")
 
 
-@app.get("/download/manifest/{track_key}")
-async def download_manifest(track_key: str):
+@router.get("/download/manifest/{track_key}")
+async def download_manifest(track_key: str, target: Target = Depends(resolve_target)):
     """The HLS playlist for a track."""
     require_lucida()
 
-    record = await servable_track(track_key)
+    record = await servable_track(track_key, target)
     if record is None:
         raise HTTPException(status_code=404, detail="Track not found")
     return Response(
-        content=hls_manifest(f"{PROXY_BASE_URL}/download/track/{record['id']}"),
+        content=hls_manifest(f"{target.base_url()}/download/track/{record['id']}"),
         media_type="application/vnd.apple.mpegurl",
     )
 
 
-@app.get("/download/track/{track_key}")
-async def download_track(track_key: str):
+@router.get("/download/track/{track_key}")
+async def download_track(track_key: str, target: Target = Depends(resolve_target)):
     """Download the track via lucidadl and stream it back."""
     require_lucida()
 
-    record = await servable_track(track_key)
+    record = await servable_track(track_key, target)
     if record is None:
         raise HTTPException(status_code=404, detail="Track not found")
     url = record.get("url")
@@ -1090,47 +1289,47 @@ async def download_track(track_key: str):
 # instance instead of erroring.
 
 
-@app.get("/playlist/")
+@router.get("/playlist/")
 async def playlist_stub(id: str = Query(...), limit: int = Query(100), offset: int = Query(0)):
     return {"version": API_VERSION, "playlist": {"uuid": id, "numberOfTracks": 0}, "items": []}
 
 
-@app.get("/mix/")
+@router.get("/mix/")
 async def mix_stub(id: str = Query(...)):
     return {"version": API_VERSION, "mix": {}, "items": []}
 
 
-@app.get("/recommendations/")
+@router.get("/recommendations/")
 async def recommendations_stub(id: str = Query(...)):
     return hifi({"limit": 20, "offset": 0, "totalNumberOfItems": 0, "items": []})
 
 
-@app.get("/cover/")
+@router.get("/cover/")
 async def cover_stub(id: Optional[str] = Query(None), q: Optional[str] = Query(None)):
     return {"version": API_VERSION, "covers": []}
 
 
-@app.get("/lyrics/")
+@router.get("/lyrics/")
 async def lyrics_stub(id: str = Query(...)):
     return {"version": API_VERSION, "lyrics": {}}
 
 
-@app.get("/artist/similar/")
+@router.get("/artist/similar/")
 async def artist_similar_stub(id: str = Query(...)):
     return {"version": API_VERSION, "artists": []}
 
 
-@app.get("/album/similar/")
+@router.get("/album/similar/")
 async def album_similar_stub(id: str = Query(...)):
     return {"version": API_VERSION, "albums": []}
 
 
-@app.get("/topvideos/")
+@router.get("/topvideos/")
 async def topvideos_stub():
     return {"version": API_VERSION, "videos": []}
 
 
-@app.api_route("/widevine", methods=["GET", "POST"])
+@router.api_route("/widevine", methods=["GET", "POST"])
 async def widevine_stub():
     return JSONResponse(
         status_code=501,
@@ -1138,7 +1337,7 @@ async def widevine_stub():
     )
 
 
-@app.get("/playback/requests/{request_id}")
+@router.get("/playback/requests/{request_id}")
 async def playback_request_stub(request_id: str):
     """This proxy downloads inline, so there is never a queued playback job."""
     return JSONResponse(
@@ -1148,9 +1347,32 @@ async def playback_request_stub(request_id: str):
     )
 
 
+# --- mount the router three times ------------------------------------------
+#
+# Order matters only in that the bare mount goes first, so a request the bare
+# routes already claim (/search/, /download/track/{id}) never gets reinterpreted
+# as a service prefix. The prefixed mounts are what turn a base URL like
+# http://localhost:8002/qobuz into a working SoulSync instance: SoulSync builds
+# every call as f"{instance}{path}", so /qobuz/search/ lands here with
+# service="qobuz" already parsed out of the path.
+#
+# include_router does not require the prefix's {service}/{country} params to be
+# declared on the handler - FastAPI still puts them in request.path_params,
+# which is where resolve_target reads them. That is what lets one handler serve
+# all three mounts instead of triplicating every route.
+app.include_router(router)
+app.include_router(router, prefix="/{service}")
+app.include_router(router, prefix="/{service}/{country}")
+
+
 @app.get("/health")
 async def health():
-    """Operational health check (not part of the HiFi API)."""
+    """Operational health check (not part of the HiFi API).
+
+    Mounted only at the root, not under a prefix: it describes the whole proxy
+    rather than one service, so there is nothing for a /{service} variant to
+    answer differently.
+    """
     if lucida.client is None:
         try:
             await lucida.initialize()
@@ -1171,6 +1393,26 @@ async def health():
         "backend_service_known": resolved_service() in KNOWN_SERVICES,
         "known_services": list(KNOWN_SERVICES),
         "fallback_order": list(FALLBACK_SERVICES),
+        # Whether a prefixed request may fall back. False means /qobuz is a hard
+        # pin: it either answers from qobuz or reports why it could not.
+        "path_fallback": PATH_FALLBACK,
+        # The URLs a client can actually paste in as a HiFi instance, each with
+        # the service and country it pins, so the list of usable prefixes is
+        # never something to derive from this source.
+        "mounted_prefixes": (
+            [{"prefix": "", "service": resolved_service(),
+              "country": service_country(resolved_service()), "pinned": False}]
+            + [
+                {"prefix": f"/{s}", "service": s, "country": service_country(s),
+                 "pinned": True}
+                for s in KNOWN_SERVICES
+            ]
+            + [
+                {"prefix": f"/{s}/{c}", "service": s, "country": c, "pinned": True}
+                for s in KNOWN_SERVICES
+                for c in _country_by_service.get(s, [])[:1]
+            ]
+        ),
         # Which country each service is searched with, or "" for none, and
         # whether that value came from lucida or from the bootstrap table.
         # A wrong value here is the difference between a working service and
@@ -1202,5 +1444,9 @@ if __name__ == "__main__":
         ", ".join(s for s in FALLBACK_SERVICES if s != resolved_service()) or "(none)",
     )
     logger.info("Requires: lucidadl installed, playwright + chromium (auto-installed if missing)")
+    logger.info(
+        "Per-service URLs: %s/<service> and %s/<service>/<country> (e.g. %s/qobuz)",
+        PROXY_BASE_URL, PROXY_BASE_URL, PROXY_BASE_URL,
+    )
 
     uvicorn.run(app, host=host, port=port)

@@ -36,6 +36,10 @@ Then check it:
 ```bash
 curl http://localhost:8002/health
 curl "http://localhost:8002/search/?s=creep&limit=3"
+
+# Pin one service (what you'd paste into SoulSync):
+curl "http://localhost:8002/qobuz/search/?s=creep&limit=3"
+curl "http://localhost:8002/qobuz/GB/search/?s=creep&limit=3"
 ```
 
 There is no build step: compose runs the image published to GHCR, which CI
@@ -61,10 +65,55 @@ Getting this wrong is the usual cause of "search works but downloads fail".
 
 ### Pointing SoulSync at it
 
-Add `http://<host>:8002` as a HiFi API instance in SoulSync's download settings,
-and make sure the "HiFi" source is enabled. The proxy answers SoulSync's
+Add the proxy as a HiFi API instance in SoulSync's download settings, and make
+sure the "HiFi" source is enabled. The proxy answers SoulSync's
 `/trackManifests/` capability probe with the health-probe id, so the instance
 should show up as able to download.
+
+Any of these work as the instance URL:
+
+| Instance URL | Searches | Notes |
+| --- | --- | --- |
+| `http://<host>:8002` | `LUCIDA_SERVICE`, then the fallback chain | The default; nothing pinned |
+| `http://<host>:8002/qobuz` | qobuz only | Hard pin — see below |
+| `http://<host>:8002/qobuz/GB` | qobuz only, searched with `GB` | Country omitted = lucida's own choice |
+
+So pinning a service is just adding it to the URL. **Add several** if you want
+SoulSync's failover between them — `http://<host>:8002/qobuz` then
+`http://<host>:8002/grilledcheese` gives a lossless-first, lossless-second chain
+without any fallback code involved.
+
+### Per-service URLs
+
+Everything is mounted three times — bare, under `/<service>`, and under
+`/<service>/<country>` — so any of those URLs is a complete, working instance.
+That works because SoulSync builds every call as `f"{instance}{path}"` and
+never parses the URL, so `/qobuz/search/` arrives at the proxy with `qobuz`
+already readable off the path.
+
+Three behaviours are worth knowing before you paste one in:
+
+- **A prefix is a hard pin.** `/qobuz` searches qobuz and *only* qobuz. If qobuz
+  is broken upstream the request fails with a `502` naming qobuz, rather than
+  quietly answering from another service with different audio. Set
+  `LUCIDA_PATH_FALLBACK=1` to opt back into the fallback chain. The bare URL is
+  unaffected and keeps falling back as it always has.
+- **A bad service is a `404`, not a silent fallback.** `/qobuzz` names the
+  services that exist rather than returning plausible results from somewhere
+  else. A country lucida has rejected for that service gets the same treatment,
+  with the accepted list in the message.
+- **The pin survives to the download.** Manifest and audio URLs keep the prefix,
+  so a track found under `/qobuz` downloads through `/qobuz`.
+
+**The country segment pins *search* only.** lucida's item route (`GET /?url=`)
+was measured ignoring `country` outright — `GB`, `US` and `FR` all resolved
+against the same `GB00` account — so `/qobuz/GB` chooses which catalogue the
+search runs against, not which account the download uses. That route takes
+`LUCIDA_COUNTRY`, which is empty by design.
+
+`GET /health` reports every usable prefix under `mounted_prefixes`, each with
+the service and country it pins, so the list is never something to derive from
+this README.
 
 ## Configuration
 
@@ -76,13 +125,16 @@ should show up as able to download.
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8002` | Bind address. |
 | `LUCIDA_USER_AGENT` | a Chrome UA | User agent used for lucida.to. |
 | `LUCIDA_PROBE_QUERY` | `test` | Query used to attach a real track to the client's probe id. |
+| `LUCIDA_PATH_FALLBACK` | *(off)* | Set to `1` to let a `/{service}` prefix fall back to another service. Off by default: a prefix is an explicit pin. The bare URL always falls back. |
 | `DOWNLOAD_DIR` | `/data/downloads` | Where downloaded audio is cached. Used verbatim when set. |
 | `LUCIDADL_HOME` | `/data` | Cloudflare cookie + browser profile location. |`GET /health` reports the resolved `backend_service`, whether
 `backend_service_known` is true, the `known_services` list, the `fallback_order`,
-the `service_country` in use with its `service_country_source`, and the full
-`accepted_countries` lucida reported per service — so a misspelled
+whether `path_fallback` is on, the `mounted_prefixes` you can paste into a
+client, the `service_country` in use with its `service_country_source`, and the
+full `accepted_countries` lucida reported per service — so a misspelled
 `LUCIDA_SERVICE` or a wrong country is one request away instead of buried in a
-log.
+log. It is mounted only at the root, since it describes the whole proxy rather
+than one service.
 
 ### Search countries are discovered, not hardcoded
 
@@ -141,7 +193,10 @@ The two `/data` defaults above come from the image. Running
 | `GET /track/` | Legacy base64 manifest with direct audio URLs. |
 | `GET /download/manifest/{id}` | The URL embedded in the HLS playlist. |
 | `GET /download/track/{id}` | The URL embedded in the legacy manifest; serves the audio. |
-| `GET /health` | Operational health (not part of the HiFi API). |
+| `GET /health` | Operational health (not part of the HiFi API). Root only. |
+
+Every route above except `/health` also answers under `/<service>` and
+`/<service>/<country>`.
 
 Everything else in the HiFi surface (`/playlist/`, `/mix/`, `/cover/`,
 `/lyrics/`, `/recommendations/`, `/topvideos/`, `/artist/similar/`,
@@ -173,6 +228,10 @@ These are real and reproduce; they are not hypothetical.
   A failing fallback logs at `INFO` and a failing *configured* service logs at
   `WARNING`; only a search no service answered logs at `ERROR`. So a healthy
   search is quiet, and a `WARNING ... failed on qobuz` line is the one to read.
+
+  A `/{service}` prefix opts out of all of that: it searches that one service and
+  reports the failure. That is the point of a pin, but it does mean an outage on
+  a pinned service becomes a visible `502` instead of a quiet substitution.
 - **Falling back can change what you get.** Fallbacks are ordered lossless
   first, but they are different libraries: `soundcloud` returns lossy audio and
   puts the *uploader* in the artist field (`Radiohead - Creep` / `deathismercy`),
