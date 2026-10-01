@@ -72,36 +72,51 @@ should show up as able to download.
 | --- | --- | --- |
 | `PROXY_BASE_URL` | `http://host.docker.internal:8002` | Address clients use to reach this proxy. |
 | `LUCIDA_SERVICE` | `qobuz` | lucida.to service to search. The services lucida.to itself offers are `qobuz`, `tidal`, `soundcloud`, `deezer`, `amazon`, `yandex` and `grilledcheese` (there is no `spotify` — it has been removed). Any other value is tried first but reported as an error at startup and in `/health`. |
-| `LUCIDA_COUNTRY` | `US` | Country used when fetching item pages and starting downloads. Search does **not** use this: each service accepts only specific countries, so search uses a per-service table (see below). |
+| `LUCIDA_COUNTRY` | *(empty = auto)* | Country sent when fetching item pages and starting downloads. Empty sends the literal `auto`, letting lucida pick the account. Search never uses this; see below. |
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8002` | Bind address. |
 | `LUCIDA_USER_AGENT` | a Chrome UA | User agent used for lucida.to. |
 | `LUCIDA_PROBE_QUERY` | `test` | Query used to attach a real track to the client's probe id. |
 | `DOWNLOAD_DIR` | `/data/downloads` | Where downloaded audio is cached. Used verbatim when set. |
-| `LUCIDADL_HOME` | `/data` | Cloudflare cookie + browser profile location. |
-
-`GET /health` reports the resolved `backend_service`, whether
-`backend_service_known` is true, the `known_services` list, the
-`fallback_order`, and the `service_country` table — so a misspelled
+| `LUCIDADL_HOME` | `/data` | Cloudflare cookie + browser profile location. |`GET /health` reports the resolved `backend_service`, whether
+`backend_service_known` is true, the `known_services` list, the `fallback_order`,
+the `service_country` in use with its `service_country_source`, and the full
+`accepted_countries` lucida reported per service — so a misspelled
 `LUCIDA_SERVICE` or a wrong country is one request away instead of buried in a
 log.
 
-### Search countries are per service
+### Search countries are discovered, not hardcoded
 
 lucida.to rejects any country a service does not accept with a bare
 `Invalid country for X`, and the accepted set differs per service. Sending one
-country for everything silently disables most services:
+country for everything silently disables most services.
 
-| Service | Country sent |
+**This proxy now asks lucida instead of guessing.** Every `/search` response —
+including one that reports `Invalid country for X` — carries a `countries` member
+listing what that service accepts. So on first use of a service the proxy sends
+one deliberately-bad country, reads the accepted set out of the reply, caches it,
+and searches with the right value from then on. `GET /health` reports both the
+value in use and `service_country_source` (`lucida` once measured, `bootstrap`
+before).
+
+`BOOTSTRAP_COUNTRY` remains only as a fallback for when that probe cannot run.
+It is a safety net, not the source of truth.
+
+> **Why this changed:** an earlier revision shipped a hardcoded table with
+> `qobuz -> US`, and qobuz accepts **GB only**. With `LUCIDA_SERVICE=qobuz` as the
+> default, every search failed with `Invalid country for qobuz`, logged one
+> `WARNING`, and was quietly answered by the fallback chain — so the proxy looked
+> healthy while never using qobuz at all. The lesson generalises: lucida publishes
+> the answer on every response, and hardcoding it is how it goes stale.
+
+Last measured from lucida's own `<select id="country">` (2026-10-01):
+
+| Service | Country |
 | --- | --- |
-| `qobuz` | `US` (the only value it accepts) |
-| `soundcloud`, `grilledcheese` | `XX` (the only value they accept) |
-| `amazon` | `US` (it accepts 48 countries) |
-| `tidal`, `deezer`, `yandex` | none found that works |
-
-lucidadl ships the wrong table — it sends `US` for every service it does not
-know, which makes SoundCloud and GrilledCheese fail every single search. The
-proxy corrects this at import time (`SERVICE_COUNTRY`), so the fix survives
-upgrading lucidadl rather than living in the vendored copy.
+| `qobuz` | `GB` (the only value it accepts) |
+| `soundcloud`, `grilledcheese` | `XX` (lucida's own sentinel, labelled `Unknown country`) |
+| `amazon` | 48 countries; `US` is one, and omitting the parameter works |
+| `tidal`, `deezer` | none configured — every attempt is rejected |
+| `yandex`, `spotify` | service disabled server-side |
 
 `/data` is a volume in the compose file, so the Cloudflare clearance, browser
 profile and download cache survive restarts. Keeping the clearance is worth it:
@@ -120,8 +135,8 @@ The two `/data` defaults above come from the image. Running
 | `GET /` | Version + status. Always 200. |
 | `GET /search/` | Search. `s`, `a`, `al` are alternative query fields; the first one supplied is used. |
 | `GET /info/` | Track detail for an id from `/search/`. |
-| `GET /album/` | Album detail. **Currently always returns an empty track list — see below.** |
-| `GET /artist/` | Artist name for an artist id seen in search results. |
+| `GET /album/` | Album detail with its track list. Works for albums seen in `/search/`. |
+| `GET /artist/` | Artist name for an artist id seen in search results, or in a track's artist field. |
 | `GET /trackManifests/` | HLS playlist URI (one segment: the whole file). |
 | `GET /track/` | Legacy base64 manifest with direct audio URLs. |
 | `GET /download/manifest/{id}` | The URL embedded in the HLS playlist. |
@@ -139,9 +154,13 @@ FastAPI's interactive docs are at `/docs`.
 
 These are real and reproduce; they are not hypothetical.
 
-- **`/album/` can never list tracks.** Search returns tracks only, and a track's
-  album id is derived from the album *title*, so the album has no lucida URL to
-  fetch. The route returns a valid but empty track list.
+- **Albums are resolved through a rewritten URL.** Search returns Qobuz storefront
+  album URLs (`www.qobuz.com/<locale>/album/<slug>/<upc>`). lucida accepts those, but
+  threw a server-side fault on 1 of 4 attempts, and refuses the locale-less
+  storefront path (`URL not supported`) and the `open.` host (`URL unrecognised`)
+  outright. The proxy normalises to `play.qobuz.com/album/{id}`, which resolved on
+  every attempt. `/album/` answers with an empty track list only for an album that
+  was never seen as an album row in `/search/` and so has no URL at all.
 - **Search depends on lucida.to's own service health, which changes.** Measured
   in one session: `qobuz` broke mid-session with an upstream 403 after working
   repeatedly, `amazon` fails every search on a backend `ENOENT`,
@@ -201,9 +220,12 @@ MIT — see [LICENSE](LICENSE) for this project's own code, and
 [lucidadl/LICENSE](lucidadl/LICENSE) for the vendored `lucidadl/` package, which
 is also MIT (Copyright (c) 2026 Jude-A and lucidadl contributors).
 
-One caveat worth knowing: this repo carries a **single local patch** inside the
-vendored `lucidadl/api.py`, which is how the proxy detects a failed search
-instead of silently returning no results. If you update `lucidadl/` from
-upstream, re-apply it — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
-the details. The vendored copy is also **pruned to the modules the proxy
-actually imports**, so it cannot stand in for the upstream CLI.
+One caveat worth knowing: the vendored `lucidadl/` used to carry a **single local
+patch** inside `api.py`, which is how the proxy detected a failed search instead
+of silently returning no results. The proxy no longer needs it — it issues and
+parses the search request itself — so **the patch has been removed and the
+vendored copy is now unmodified upstream**. Updating `lucidadl/` is a clean file
+copy with nothing to re-apply. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The vendored copy is also
+**pruned to the modules the proxy actually imports**, so it cannot stand in for
+the upstream CLI.

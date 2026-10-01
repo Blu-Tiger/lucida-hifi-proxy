@@ -7,9 +7,10 @@ version 1.4.0 (per `lucidadl/__init__.py`). It is **MIT licensed**, Copyright
 (c) 2026 Jude-A and lucidadl contributors. The upstream license text is
 reproduced at <lucidadl/LICENSE>, and is what permits redistribution here.
 
-It is vendored rather than installed as a dependency because this proxy carries
-one small patch inside `lucidadl/api.py` (see below), which a pinned PyPI
-release would not include.
+It is vendored rather than installed as a dependency because this proxy pins a
+specific upstream version to keep the documented wire behaviour stable, and
+because a pinned PyPI release would not include the one local block described
+below (which the proxy no longer needs — see "Local modification").
 
 Upstream license: <https://github.com/Jude-A/lucidadl/blob/main/LICENSE>
 
@@ -30,21 +31,29 @@ installs.
 To restore the full package, copy the deleted files back from
 <https://github.com/Jude-A/lucidadl> at version 1.4.0.
 
-### Local modification
+### No local modifications
 
-Exactly one block was added, at the end of `search()` in `lucidadl/api.py`. It
-copies lucida.to's in-band `{"success": false, "error": "..."}` value into a
-`results["error"]` key so the proxy can tell "this search failed" apart from
-"this search matched nothing", which the stock code collapses into the same
-empty result. The block is marked in the source with:
+An earlier revision carried one patch at the end of `search()` in
+`lucidadl/api.py`, copying lucida.to's in-band `{"success": false, "error":
+"..."}` into a `results["error"]` key so the proxy could tell "this search
+failed" apart from "this search matched nothing".
 
-```
-PATCH TO UPSTREAM lucidadl: re-apply after updating it.
-```
+**That patch has been removed.** `LucidaWrapper.search()` now issues the
+`/search` request itself and decodes the SvelteKit data node directly
+(`extract_data_node` / `flatten_search`), so it reads the in-band failure flag
+from lucida's response without help from the patched branch. It also no longer
+overrides `api.default_country`, because the accepted country is now discovered
+from the `countries` member that rides on every response.
 
-Every file that remains is upstream and unmodified apart from that one block. If
-you upgrade `lucidadl/`, re-apply it or search failure detection regresses to
-silent empty results.
+Consequences:
+
+- `LucidaClient.search()` is unused by this project. The upstream copy is kept
+  for the parts this proxy does use (`_get` with its Cloudflare refresh and
+  retry, `fetch_page_data`, `tracks_from_pd`, `start_download`, `run_job`).
+- **Updating `lucidadl/` is now a clean file copy** — there is nothing to
+  re-apply, and no marker to grep for.
+- A future refactor could rebase the vendored tree onto upstream at any time
+  without behavioural risk to this proxy.
 
 ## `hifi-api` — MIT
 

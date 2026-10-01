@@ -34,6 +34,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -64,18 +65,30 @@ KNOWN_SERVICES = (
 
 # Country to search each service with, or "" to send none. lucida.to rejects any
 # country a service does not accept with a plain "Invalid country for X", and
-# the accepted set differs per service - it is NOT one global country. Measured
-# 2026-09 against lucida.to's own <select id="country">:
-#   qobuz     US only
-#   amazon    48 countries (US is one); its search backend is broken separately
+# the accepted set differs per service - it is NOT one global country.
+#
+# This table is only a BOOTSTRAP value. It is overridden at runtime by
+# `discover_countries()`, which reads the accepted set out of lucida's own
+# search response. A hardcoded table is exactly what went stale before: an
+# earlier revision of this file shipped qobuz -> "US", while qobuz accepts GB
+# only, so every search on the default service failed and the fallback chain
+# quietly answered instead. Measured 2026-10-01 from lucida's own
+# <select id="country">:
+#   qobuz     GB only
 #   soundcloud, grilledcheese   XX only
-#   tidal, deezer, yandex      no country we could find that works
-SERVICE_COUNTRY = {
-    "qobuz": "US",
+#   amazon    48 countries (US is one); its search backend is broken separately
+#   tidal, deezer      no accepted country configured at all
+BOOTSTRAP_COUNTRY = {
+    "qobuz": "GB",
     "soundcloud": "XX",
     "grilledcheese": "XX",
     "amazon": "US",
 }
+
+# Filled in at runtime by `LucidaWrapper.discover_countries()` from the live
+# service, and reported by /health. Empty until a service has been used.
+_country_by_service: Dict[str, List[str]] = {}
+_country_lock = asyncio.Lock()
 
 # Fallback order for a HiFi proxy, so lossless sources are preferred and lossy
 # ones are a last resort: qobuz and grilledcheese both returned verified FLAC,
@@ -85,7 +98,12 @@ SERVICE_COUNTRY = {
 # service costs a wasted upstream round-trip on every search. Set LUCIDA_SERVICE
 # to one of them explicitly to use it anyway.
 FALLBACK_SERVICES = ("qobuz", "grilledcheese", "soundcloud")
-COUNTRY = os.getenv("LUCIDA_COUNTRY", "US")
+# Account/country to resolve item pages and start downloads with. Empty by
+# default, which sends the literal "auto" in the load request and lets lucida
+# pick the account. A specific value is not rejected, but the item route was
+# measured ignoring `country` entirely (GB, US and FR all resolved against the
+# same account), so pinning one here buys nothing and can only go stale.
+COUNTRY = os.getenv("LUCIDA_COUNTRY", "")
 USER_AGENT = os.getenv(
     "LUCIDA_USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -144,19 +162,182 @@ def resolved_service() -> str:
 
 
 def service_country(service: str) -> str:
-    """Country to search `service` with, or "" to send no country param."""
-    return SERVICE_COUNTRY.get(api.normalize_service(service), "")
+    """Country to search `service` with, or "" to send no country param.
+
+    Prefers what the live service reported over `BOOTSTRAP_COUNTRY`, so a
+    service whose accepted countries change needs no code change here.
+    """
+    name = api.normalize_service(service)
+    known = _country_by_service.get(name) or []
+    if known:
+        return known[0]
+    return BOOTSTRAP_COUNTRY.get(name, "")
 
 
-# lucidadl answers "which country?" from a module-level function that
-# `LucidaClient.search` calls directly, and its shipped answers are wrong: it
-# sends US for every service it does not know, but SoundCloud and GrilledCheese
-# accept ONLY XX, so they failed outright with "Invalid country" and read as
-# permanently broken services. Overriding it here rather than editing the
-# vendored copy keeps the correction attached to this proxy, where it survives
-# reinstalling or upgrading lucidadl. Verified live: soundcloud and
-# grilledcheese both return tracks through this path.
-api.default_country = service_country
+# ---------------------------------------------------------------------------
+# lucida.to wire format
+#
+# lucida.to has no JSON read API: /search and /?url= are server-rendered
+# SvelteKit pages whose machine-readable payload is a JSON5 data node embedded
+# in the HTML. Slice it out with these two literal delimiters and parse it as
+# JSON5 - the keys are unquoted, so a standard JSON parser fails.
+# ---------------------------------------------------------------------------
+
+_PD_START = ',{"type":"data","data":'
+_PD_END = ',"uses":{"url":1}}];'
+
+
+def extract_data_node(html_text: str) -> Optional[Dict[str, Any]]:
+    """Return the decoded SvelteKit data node, or None if there isn't one.
+
+    None means the response carried no payload at all - a Cloudflare
+    interstitial, typically - which is NOT the same as a payload that decoded
+    cleanly to an object reporting a search failure.
+    """
+    import pyjson5
+
+    start = html_text.find(_PD_START)
+    if start < 0:
+        return None
+    start += len(_PD_START)
+    end = html_text.find(_PD_END, start)
+    if end < 0:
+        return None
+    try:
+        node = pyjson5.loads(html_text[start:end])
+    except Exception:
+        logger.warning("lucida data node did not parse as JSON5", exc_info=True)
+        return None
+    return node if isinstance(node, dict) else None
+
+
+def accepted_countries(node: Dict[str, Any]) -> List[str]:
+    """Country codes lucida accepts for the service this page was rendered for.
+
+    `countries` rides on EVERY search response - success *and* failure - so it
+    is readable from a response that just reported `Invalid country for X`.
+    That is what makes runtime discovery possible: one deliberately bad request
+    is enough to learn the right answer, so the answer cannot go stale.
+    """
+    envelope = node.get("countries")
+    rows = envelope.get("countries") if isinstance(envelope, dict) else envelope
+    codes: List[str] = []
+    for row in rows or []:
+        code = row.get("code") if isinstance(row, dict) else None
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def canonical_album_url(url: str, provider_id: str = "") -> str:
+    """Normalise a Qobuz album URL to the form lucida.to resolves most reliably.
+
+    Measured 2026-10-01 against UPC 0886443927087, several attempts each:
+
+      play.qobuz.com/album/{upc}             -> resolves (2/2)
+      www.qobuz.com/<locale>/album/<slug>/<upc>  -> resolves, but threw a
+                                                 server-side fault once in
+                                                 four attempts
+      www.qobuz.com/album/<slug>/<upc>       -> "URL not supported" (2/2)
+      open.qobuz.com/album/<slug>/<upc>      -> "URL unrecognised" (2/2)
+
+    So lucida wants a locale path segment, or the bare play.* form. Search
+    returns the locale-prefixed storefront URL, which works but is not
+    dependable, so it is normalised to the canonical form rather than passed
+    through and retried. Track URLs need no rewrite: search already returns
+    play.qobuz.com/track/{id}, which resolves as-is.
+    """
+    if not url:
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    if provider_id and (host == "qobuz.com" or host.endswith(".qobuz.com")):
+        return f"https://play.qobuz.com/album/{provider_id}"
+    return url
+
+
+def _artist_names(row: Dict[str, Any]) -> str:
+    names: List[str] = []
+    for artist in row.get("artists") or []:
+        name = (artist.get("name") or "").strip() if isinstance(artist, dict) else ""
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names)
+
+
+def _album_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    url = row.get("url")
+    if not url or not isinstance(url, str):
+        return None
+    provider_id = str(row.get("upc") or row.get("id") or "")
+    return {
+        "url": canonical_album_url(url, provider_id),
+        "title": row.get("title") or "",
+        "artist": _artist_names(row),
+        # Stable across every row referring to this album, so /album/ is
+        # reachable from a track's album.id as well as from the album list.
+        "key": provider_id or url,
+    }
+
+
+def _track_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    url = row.get("url")
+    if not url or not isinstance(url, str):
+        return None
+    album = row.get("album") if isinstance(row.get("album"), dict) else {}
+    album_title = (album.get("title") or "").strip()
+    album_key = str(album.get("upc") or album.get("id") or "")
+    return {
+        "url": url,
+        "title": row.get("title") or "",
+        "artist": _artist_names(row),
+        "album": album_title,
+        # The same key /album/ files an album under, so a track's album.id
+        # resolves to a record with a usable lucida URL.
+        "album_key": album_key or album_title,
+    }
+
+
+def flatten_search(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn a decoded search data node into tracks/albums/artists lists.
+
+    Owned here rather than delegated to lucidadl, for two reasons. It is what
+    tells "this search failed" apart from "this search matched nothing" -
+    lucida reports failure in-band at HTTP 200, and the stock client collapses
+    both into the same empty result (that is what the vendored patch existed
+    for, and it is no longer needed). And it is what carries an album's own id
+    through, which is what /album/ needs in order to work at all.
+    """
+    envelope = node.get("results") if isinstance(node, dict) else None
+    if not isinstance(envelope, dict):
+        return {"tracks": [], "albums": [], "artists": []}
+
+    out: Dict[str, Any] = {"tracks": [], "albums": [], "artists": []}
+    if envelope.get("success") is False:
+        # In-band failure at HTTP 200. The nested `results` key is absent here.
+        out["error"] = str(envelope.get("error") or "search failed")
+        return out
+
+    sets = envelope.get("results") if isinstance(envelope.get("results"), dict) else {}
+    for row in sets.get("albums") or []:
+        if isinstance(row, dict):
+            album = _album_from_row(row)
+            if album:
+                out["albums"].append(album)
+    for row in sets.get("tracks") or []:
+        if isinstance(row, dict):
+            track = _track_from_row(row)
+            if track:
+                out["tracks"].append(track)
+    for row in sets.get("artists") or []:
+        if isinstance(row, dict):
+            name = (row.get("name") or "").strip()
+            if name:
+                out["artists"].append({
+                    "url": row.get("url") or "",
+                    "name": name,
+                    "key": str(row.get("id") or name),
+                })
+    return out
 
 MEDIA_TYPES = {
     ".flac": "audio/flac",
@@ -210,12 +391,14 @@ class MetadataCache:
         return int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:16], 16)
 
     def put_track(self, url: str, title: str = "", artist: str = "",
-                  album: str = "") -> Optional[Dict[str, Any]]:
+                  album: str = "",
+                  album_key: str = "") -> Optional[Dict[str, Any]]:
         """Store a lucida track URL and return its Tidal-shaped record."""
         if not url:
             return None
         artist_name = (artist or "").strip() or "Unknown Artist"
         album_title = (album or "").strip()
+        album_id = self.id_for(album_key or album_title) if (album_key or album_title) else None
         artist_id = self.id_for(artist_name)
         record: Dict[str, Any] = {
             "id": self.id_for(url),
@@ -223,7 +406,7 @@ class MetadataCache:
             "title": title or "Unknown",
             "artists": [{"id": artist_id, "name": artist_name}],
             "album": {
-                "id": self.id_for(album_title) if album_title else None,
+                "id": album_id,
                 "title": album_title,
             },
             # lucida search exposes no duration or ISRC; 0 means "unknown".
@@ -233,27 +416,55 @@ class MetadataCache:
         }
         self.tracks[record["id"]] = record
         self.artists[artist_id] = {"id": artist_id, "name": artist_name}
-        if album_title:
-            self.albums.setdefault(self.id_for(album_title), {
-                "id": self.id_for(album_title),
+        if album_id is not None:
+            # setdefault, not assignment: an album row from the same search has
+            # already filed this album under the SAME id with a real lucida URL,
+            # and overwriting that with an empty url is what used to make
+            # /album/ report "no tracks" for an album lucida can resolve.
+            self.albums.setdefault(album_id, {
+                "id": album_id,
                 "url": "",
+                "key": album_key or album_title,
                 "title": album_title,
                 "artist": artist_name,
             })
         return record
 
-    def put_album(self, url: str, title: str = "",
-                  artist: str = "") -> Optional[Dict[str, Any]]:
-        """Store a lucida album URL so /album/ can fetch its track list."""
+    def put_album(self, url: str, title: str = "", artist: str = "",
+                  key: str = "") -> Optional[Dict[str, Any]]:
+        """Store a lucida album URL so /album/ can fetch its track list.
+
+        Filed under `key or url` - the same key `put_track` uses for a track's
+        `album.id`. The two used to derive ids differently (album title here,
+        album URL there), so a client following /search/ -> track -> album.id
+        never found the record this method wrote and /album/ always answered
+        with an empty track list.
+        """
         if not url:
             return None
+        album_id = self.id_for(key or url)
         record = {
-            "id": self.id_for(url),
+            "id": album_id,
             "url": url,
+            "key": key or url,
             "title": title or "Unknown Album",
             "artist": artist,
         }
-        self.albums[record["id"]] = record
+        self.albums[album_id] = record
+        return record
+
+    def put_artist(self, name: str) -> Optional[Dict[str, Any]]:
+        """Register an artist seen in /search/ under the same id `put_track` uses.
+
+        Keyed by name so an artist reached from a search row and the same artist
+        reached from a track's artist field resolve to one record.
+        """
+        artist_name = (name or "").strip()
+        if not artist_name:
+            return None
+        artist_id = self.id_for(artist_name)
+        record = {"id": artist_id, "name": artist_name, "url": ""}
+        self.artists[artist_id] = record
         return record
 
     def alias(self, alias_id: int, record: Dict[str, Any]) -> None:
@@ -337,6 +548,61 @@ class LucidaWrapper:
             except Exception:
                 logger.exception("Error while closing lucidadl HTTP session")
 
+    async def raw_search(self, service: str, country: str,
+                         query: str) -> Optional[Dict[str, Any]]:
+        """GET lucida's /search page and return its decoded data node.
+
+        Returns None when the response carried no data node at all, which is
+        what a Cloudflare challenge looks like - distinct from a node that
+        decoded cleanly and then reported a search failure.
+        """
+        assert self.client is not None
+        params = {"service": service, "query": query}
+        if country:
+            params["country"] = country
+        try:
+            # _get is private to lucidadl but carries the Cloudflare-refresh
+            # and bounded-retry behaviour this proxy depends on; going straight
+            # to client.http would drop it.
+            response = await self.client._get(api.LUCIDA + "/search", params=params)
+        except Exception as exc:
+            logger.warning("lucida search request failed for %s: %s", service, exc)
+            return None
+        return extract_data_node(response.text)
+
+    async def discover_countries(self, service: str) -> List[str]:
+        """Learn which countries `service` accepts, from the live service.
+
+        Sent deliberately with a country lucida does not know, because the
+        response still carries the accepted set whether the search succeeds or
+        fails. Cached per service, so this costs one wasted round-trip per
+        service per process - and unlike a hardcoded table it cannot go stale.
+        """
+        name = api.normalize_service(service)
+        async with _country_lock:
+            if name in _country_by_service:
+                return _country_by_service[name]
+
+        node = await self.raw_search(name, "ZZ", PROBE_QUERY)
+        codes = accepted_countries(node) if node else []
+        if not codes:
+            logger.warning(
+                "could not read lucida's accepted countries for %s; using the "
+                "bootstrap value %r", name, BOOTSTRAP_COUNTRY.get(name, ""))
+            return []
+
+        async with _country_lock:
+            _country_by_service[name] = codes
+        shown = ", ".join(codes[:8]) + (", ..." if len(codes) > 8 else "")
+        logger.info("lucida accepts %d country/countries for %s: %s",
+                    len(codes), name, shown)
+        stale = BOOTSTRAP_COUNTRY.get(name)
+        if stale and stale not in codes:
+            logger.warning(
+                "bootstrap country %r for %s is not accepted by lucida; "
+                "using %r instead", stale, name, codes[0])
+        return codes
+
     async def search(self, query: str) -> Dict[str, Any]:
         """Search, failing over when a service is broken upstream.
 
@@ -370,11 +636,14 @@ class LucidaWrapper:
             log("lucida search failed on %s: %s", service, detail)
 
         for service in services:
-            try:
-                results = await self.client.search(query=query, service=service)
-            except Exception as e:
-                report(service, e)
+            # Learn the accepted country first, then search with it. Both are
+            # cached, so a service only pays for discovery once.
+            await self.discover_countries(service)
+            node = await self.raw_search(service, service_country(service), query)
+            if node is None:
+                report(service, "no data node in response (Cloudflare challenge?)")
                 continue
+            results = flatten_search(node)
             if results.get("error"):
                 report(service, results["error"])
                 continue
@@ -609,11 +878,16 @@ async def search(
         raise HTTPException(status_code=502, detail=f"lucida search failed: {results['error']}")
 
     for album in results.get("albums", []):
-        cache.put_album(album.get("url", ""), album.get("title", ""), album.get("artist", ""))
+        cache.put_album(album.get("url", ""), album.get("title", ""),
+                        album.get("artist", ""), album.get("key", ""))
+
+    for artist in results.get("artists", []):
+        cache.put_artist(artist.get("name", ""))
 
     items = [record for record in (
         cache.put_track(track.get("url", ""), track.get("title", ""),
-                        track.get("artist", ""), track.get("album", ""))
+                        track.get("artist", ""), track.get("album", ""),
+                        track.get("album_key", ""))
         for track in results.get("tracks", [])
     ) if record is not None]
 
@@ -638,8 +912,14 @@ async def album(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """Album detail with its track list. Only albums that came from /search/
-    (and so have a lucida URL) can be fetched."""
+    """Album detail with its track list.
+
+    Albums seen in a /search/ response carry a lucida URL and can be resolved;
+    the URL is normalised to the canonical form the item route accepts most
+    reliably, because search hands back a storefront URL that works but is not
+    dependable. An album that was only ever seen as a track's album reference
+    has no URL and answers empty.
+    """
     require_lucida()
 
     record = cache.album(id)
@@ -659,7 +939,8 @@ async def album(
 
     items = [entry for entry in (
         cache.put_track(entry["track"].get("url", ""), entry["track"].get("title", ""),
-                        record.get("artist", ""), record.get("title", ""))
+                        record.get("artist", ""), record.get("title", ""),
+                        record.get("key", ""))
         for entry in resolved
     ) if entry is not None]
 
@@ -676,8 +957,8 @@ async def album(
 
 @app.get("/artist/")
 async def artist(id: str = Query(...)):
-    """Artist detail. Lucida search does not return artists, so this resolves
-    only artists learned from track results."""
+    """Artist detail. Resolves artists seen in /search/ results as well as those
+    learned from a track's artist field."""
     record = cache.artist(id)
     if record is None:
         return hifi({})
@@ -890,10 +1171,17 @@ async def health():
         "backend_service_known": resolved_service() in KNOWN_SERVICES,
         "known_services": list(KNOWN_SERVICES),
         "fallback_order": list(FALLBACK_SERVICES),
-        # Which country each service is searched with, or "" for none. Wrong
-        # values here are the difference between a working service and an
-        # "Invalid country for X" failure.
+        # Which country each service is searched with, or "" for none, and
+        # whether that value came from lucida or from the bootstrap table.
+        # A wrong value here is the difference between a working service and
+        # an "Invalid country for X" failure, so both are reported.
         "service_country": {s: service_country(s) for s in KNOWN_SERVICES},
+        "service_country_source": "lucida" if _country_by_service else "bootstrap",
+        # Everything lucida says it accepts, once discovered. Empty until a
+        # service has actually been searched.
+        "accepted_countries": {
+            s: list(_country_by_service.get(s, [])) for s in KNOWN_SERVICES
+        },
     }
 
 
@@ -907,7 +1195,8 @@ if __name__ == "__main__":
     # Resolved here so an unrecognized service is reported at startup, before the
     # first search, rather than only as a warning once a search has already failed.
     logger.info(
-        "Search service: %s (country=%s), then fallbacks %s",
+        "Search service: %s (country=%s, refined from lucida on first use), "
+        "then fallbacks %s",
         resolved_service(),
         service_country(SERVICE) or "(none)",
         ", ".join(s for s in FALLBACK_SERVICES if s != resolved_service()) or "(none)",

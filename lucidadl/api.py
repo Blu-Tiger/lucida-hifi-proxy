@@ -258,14 +258,6 @@ class LucidaClient:
             self.log(f"  (search parse: {e})")
             return {"tracks": [], "albums": [], "artists": []}
         results = _extract_search_results(data)
-        # lucida answers 200 with success:false when the *service* is broken
-        # (disabled, backend error, bad country). _extract_search_results can't
-        # tell that apart from a query that matched nothing, and its callers
-        # need to, so mark it and let them own the policy. The CLI ignores the
-        # extra key. PATCH TO UPSTREAM lucidadl: re-apply after updating it.
-        envelope = data.get("results") if isinstance(data, dict) else None
-        if isinstance(envelope, dict) and envelope.get("success") is False:
-            results["error"] = str(envelope.get("error") or "search failed")
         return results
 
     # -- item page -> token + tracks ----------------------------------------
