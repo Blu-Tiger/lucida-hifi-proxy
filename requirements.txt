@@ -1,7 +1,11 @@
 # Pinned to the versions this proxy was last verified against.
 # httpx[http2] pulls in h2, which lucidadl needs (it opens HTTP/2 connections).
 fastapi==0.141.1
-uvicorn[standard]==0.53.0
+# Plain uvicorn, not uvicorn[standard]: the standard extras (uvloop, httptools,
+# watchfiles, websockets, PyYAML, python-dotenv) are unused here - the proxy
+# runs one asyncio loop with no reload, no WebSocket endpoints and no .env
+# loading - and they cost tens of MB in the image.
+uvicorn==0.53.0
 httpx[http2]==0.28.1
 pyjson5==2.0.1
 playwright==1.63.0

@@ -294,7 +294,9 @@ These are real and reproduce; they are not hypothetical.
   end-to-end.
 - **A container needs a virtual display.** lucida.to's Cloudflare check rejects a
   truly headless browser, so the image runs Chromium under Xvfb. Expect it to use
-  a few hundred MB of RAM.
+  a few hundred MB of RAM. The image itself is ~400 MB compressed: Chromium and
+  its system libraries dominate, and Playwright's headless-shell build (which
+  this proxy never launches) is deliberately left out of the image.
 - **The image is published under `:latest` with no versioned tags yet**, so a
   fresh pull can change behaviour under you. Pushing a `v*` tag makes CI publish
   a version tag you can pin to instead.
