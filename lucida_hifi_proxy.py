@@ -56,10 +56,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from lucidadl import api, utils
 from lucidadl.session import (
-    acquire_clearance,
+    LUCIDA,
     chromium_installed,
+    get_page,
     install_chromium,
+    is_challenged,
     load_clearance,
+    lucida_context,
+    save_clearance,
 )
 
 # ---------------------------------------------------------------------------
@@ -700,6 +704,77 @@ def _short_error(exc: Exception) -> str:
     return text.splitlines()[0][:300]
 
 
+async def _click_turnstile(page: Any) -> bool:
+    """Click Cloudflare's verification widget inside its own iframe.
+
+    The checkbox lives in a cross-origin challenges.cloudflare.com frame with
+    no stable selector, but clicking the widget's centre is what a human does,
+    and that is enough. Best effort: a miss just means the caller tries again.
+    """
+    for frame in page.frames:
+        if "challenges.cloudflare.com" not in (frame.url or ""):
+            continue
+        try:
+            await frame.click("body", timeout=3_000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def ensure_cleared_with_click(ctx: Any, timeout: int = 180) -> bool:
+    """lucidadl's `ensure_cleared`, plus a click on Cloudflare's Turnstile.
+
+    On a desktop the managed challenge resolves on its own and lucidadl just
+    waits for it. In a container Cloudflare instead serves an *interactive*
+    "Verify you are human" widget that never resolves without a click - which
+    is the exact failure this image kept hitting ("Cloudflare not cleared").
+    Clicking the widget clears it in seconds; verified in the published image
+    both on-screen and off-screen (the off-screen position the hidden browser
+    uses), on 2026-10-03.
+    """
+    page = await get_page(ctx)
+    try:
+        await page.goto(LUCIDA + "/", wait_until="domcontentloaded", timeout=60_000)
+    except Exception:
+        # The challenge can intercept the navigation; the page state is what
+        # matters, and it is inspected below.
+        pass
+    deadline = time.monotonic() + timeout
+    last_click = 0.0
+    while time.monotonic() < deadline:
+        if not await is_challenged(page):
+            return True
+        now = time.monotonic()
+        if now - last_click >= 10:
+            last_click = now
+            if await _click_turnstile(page):
+                logger.info("clicked Cloudflare's verification widget")
+        await page.wait_for_timeout(1500)
+    return not await is_challenged(page)
+
+
+async def acquire_clearance_with_click(hidden: bool = True) -> Any:
+    """lucidadl's `acquire_clearance` with the Turnstile click added.
+
+    Same contract: open the browser briefly, clear the challenge, harvest
+    cf_clearance + the user agent that solved it, persist both, close. The
+    cookie is reused over httpx afterwards, so no browser stays open.
+    """
+    async with lucida_context(hidden=hidden) as ctx:
+        if not await ensure_cleared_with_click(ctx):
+            raise RuntimeError("Cloudflare not cleared")
+        cookies = await ctx.cookies("https://lucida.to")
+        cf = next((c["value"] for c in cookies if c["name"] == "cf_clearance"), None)
+        page = await get_page(ctx)
+        ua = (await page.evaluate("() => navigator.userAgent")).replace(
+            "HeadlessChrome", "Chrome")
+    if not cf:
+        raise RuntimeError("cf_clearance missing after clearing Cloudflare")
+    save_clearance(cf, ua)
+    return cf, ua
+
+
 class LucidaWrapper:
     """Async adapter around lucidadl's LucidaClient.
 
@@ -764,7 +839,7 @@ class LucidaWrapper:
                         % (now - self._clearance_failed_at, CLEARANCE_COOLDOWN)
                     )
                 try:
-                    creds = await acquire_clearance(hidden=True)
+                    creds = await acquire_clearance_with_click(hidden=True)
                 except Exception as exc:
                     self._clearance_failed_at = time.monotonic()
                     self._clearance_error = _short_error(exc)
