@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 from base64 import b64encode
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -54,7 +55,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lucidadl import api, utils
-from lucidadl.session import acquire_clearance, chromium_installed, install_chromium
+from lucidadl.session import (
+    acquire_clearance,
+    chromium_installed,
+    install_chromium,
+    load_clearance,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -127,8 +133,19 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
-# Must be the address the CLIENT can reach (LAN IP when SoulSync runs elsewhere).
-PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://host.docker.internal:8002").rstrip("/")
+# Optional. When empty (the default), each request's own Host header decides
+# the address embedded in the manifest URLs it returns - an address the client
+# is by definition able to reach, because it just used it. The old default, a
+# pinned host.docker.internal, broke downloads silently for any client that
+# could not resolve it: the manifest was answered, and the download request it
+# pointed at simply never arrived. Set this only when the Host header is not
+# what clients should use, e.g. behind a reverse proxy.
+PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "").rstrip("/")
+
+# After a failed Cloudflare-clearance attempt, wait this long before launching
+# the browser again. Otherwise every challenged request pays for another
+# launch, and a container whose browser cannot start respawns it per search.
+CLEARANCE_COOLDOWN = float(os.getenv("LUCIDA_CLEARANCE_COOLDOWN") or 60)
 
 MAX_CACHE_SIZE = 1000
 # Tidal track id the client uses to probe whether an instance can download.
@@ -154,6 +171,7 @@ logging.basicConfig(
 logger = logging.getLogger("lucida-proxy")
 
 _unknown_service_reported = False
+_mismatched_host_reported = False
 
 
 def resolved_service() -> str:
@@ -214,10 +232,14 @@ class Target:
     country: str
     prefix: str
     pinned: bool
+    # Scheme + Host this request arrived with. Used as the download base unless
+    # PROXY_BASE_URL overrides it: a client can always reach the address it just
+    # used, which is the entire reason this is preferred over a pinned one.
+    origin: str
 
     def base_url(self) -> str:
         """Absolute base for URLs this request hands back to the client."""
-        return PROXY_BASE_URL + self.prefix
+        return (PROXY_BASE_URL or self.origin) + self.prefix
 
 
 def validate_service(raw: str) -> str:
@@ -288,17 +310,37 @@ def resolve_target(request: Request) -> Target:
     One handler serves all three mounts, so this is the single place the prefix
     is interpreted. On a bare route both path params are simply absent and the
     request falls back to the configured service.
+
+    The request's own origin is captured here too, because it is what the
+    manifest URLs are built from when PROXY_BASE_URL is unset.
     """
+    global _mismatched_host_reported
+
+    origin = str(request.base_url).rstrip("/")
+    if PROXY_BASE_URL and not _mismatched_host_reported:
+        pinned = urlparse(PROXY_BASE_URL).netloc.lower()
+        arrived = (request.headers.get("host") or "").lower()
+        if pinned and arrived and pinned != arrived:
+            _mismatched_host_reported = True
+            logger.warning(
+                "PROXY_BASE_URL pins manifest URLs at %s, but this request "
+                "arrived with Host %s; downloads will be fetched from %s. "
+                "Unset PROXY_BASE_URL to use the Host the client sent.",
+                PROXY_BASE_URL, arrived, pinned,
+            )
+
     raw_service = request.path_params.get("service")
     raw_country = request.path_params.get("country")
 
     if not raw_service:
-        return Target(service=resolved_service(), country="", prefix="", pinned=False)
+        return Target(service=resolved_service(), country="", prefix="",
+                      pinned=False, origin=origin)
 
     service = validate_service(raw_service)
     country = validate_country(service, raw_country) if raw_country else ""
     prefix = f"/{service}" + (f"/{country}" if country else "")
-    return Target(service=service, country=country, prefix=prefix, pinned=True)
+    return Target(service=service, country=country, prefix=prefix, pinned=True,
+                  origin=origin)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +689,17 @@ cache = MetadataCache(MAX_CACHE_SIZE)
 # ---------------------------------------------------------------------------
 
 
+def _short_error(exc: Exception) -> str:
+    """First line of an exception, for /health and API error details.
+
+    Playwright appends a multi-KB call log after the first line; the full text
+    is already logged once by the browser refresh, so only the cause travels
+    into the places a human reads.
+    """
+    text = str(exc).strip() or type(exc).__name__
+    return text.splitlines()[0][:300]
+
+
 class LucidaWrapper:
     """Async adapter around lucidadl's LucidaClient.
 
@@ -657,6 +710,16 @@ class LucidaWrapper:
     def __init__(self) -> None:
         self.client: Optional[api.LucidaClient] = None
         self._init_lock = asyncio.Lock()
+        # Clearance state. `_clearance_failed_at` implements the cooldown: a
+        # browser that cannot launch must not be relaunched by every challenged
+        # request in turn. `_clearance_error` is what /health and the search
+        # error text report.
+        self._clearance_failed_at = 0.0
+        self._clearance_error = ""
+        self._warm_task: Optional[asyncio.Task] = None
+        # Why the last raw search carried no data node, so the caller reports
+        # "HTTP 403 from a Cloudflare challenge" instead of a blank guess.
+        self.last_search_error = ""
 
     async def initialize(self) -> None:
         async with self._init_lock:
@@ -664,25 +727,122 @@ class LucidaWrapper:
                 return
 
             if not await chromium_installed():
-                logger.info("Chromium not found, installing...")
-                await install_chromium()
+                logger.warning(
+                    "Chromium not found; installing it - without a browser a "
+                    "Cloudflare challenge cannot be solved"
+                )
+                if not await install_chromium():
+                    logger.error(
+                        "Chromium installation failed. Every lucida request "
+                        "will be answered with a Cloudflare challenge unless a "
+                        "clearance cookie is already on disk. Use an image that "
+                        "bundles Chromium (the published one does)."
+                    )
+
+            # A clearance cookie saved by an earlier run (on the Docker volume)
+            # is reused as-is: cf_clearance is what every request needs, and
+            # loading it takes the browser off the critical path entirely. It is
+            # bound to the User-Agent that solved the challenge, so the saved UA
+            # travels with it.
+            saved_cf, saved_ua = load_clearance()
+            if saved_cf:
+                logger.info("Reusing the saved Cloudflare clearance cookie")
+            else:
+                logger.info(
+                    "No saved Cloudflare clearance; one will be acquired with "
+                    "the browser before lucida can be used"
+                )
 
             async def _acquire():
-                return await acquire_clearance(hidden=True)
+                now = time.monotonic()
+                if (self._clearance_failed_at
+                        and now - self._clearance_failed_at < CLEARANCE_COOLDOWN):
+                    raise RuntimeError(
+                        "browser refresh skipped: the previous attempt failed "
+                        "%.0fs ago (browser launches are limited to one per "
+                        "%.0fs while they keep failing)"
+                        % (now - self._clearance_failed_at, CLEARANCE_COOLDOWN)
+                    )
+                try:
+                    creds = await acquire_clearance(hidden=True)
+                except Exception as exc:
+                    self._clearance_failed_at = time.monotonic()
+                    self._clearance_error = _short_error(exc)
+                    raise
+                self._clearance_failed_at = 0.0
+                self._clearance_error = ""
+                return creds
 
             client = api.LucidaClient(
-                None,
-                USER_AGENT,
+                saved_cf,
+                saved_ua or USER_AGENT,
                 acquire=_acquire,
                 country=COUNTRY,
                 downscale="original",
                 metadata=True,
                 jobs=1,
-                log=lambda msg: logger.debug("lucidadl: %s", msg),
+                # lucidadl reports a failed Cloudflare refresh through this
+                # callback. At DEBUG it was invisible - which is how a container
+                # whose browser cannot start answered 502s without ever saying
+                # why.
+                log=self._lucidadl_log,
             )
             await client.start_http()
             self.client = client
             logger.info("lucidadl client initialized (service=%s)", resolved_service())
+
+            # Solve the challenge before a request needs it, and say up front
+            # whether that worked.
+            if not saved_cf:
+                self._warm_task = asyncio.create_task(self.warm_clearance())
+
+    @staticmethod
+    def _lucidadl_log(msg: Any) -> None:
+        """Route lucidadl's own messages to a visible log level.
+
+        Everything stays at DEBUG except the Cloudflare-refresh failure, which
+        is the one message that explains a total lucida outage.
+        """
+        text = str(msg).strip()
+        lowered = text.lower()
+        if "cloudflare refresh failed" in lowered or "clearance" in lowered:
+            logger.warning("lucidadl: %s", text)
+        else:
+            logger.debug("lucidadl: %s", text)
+
+    async def warm_clearance(self) -> None:
+        """Acquire a Cloudflare clearance ahead of the first lucida request.
+
+        Reuses lucidadl's own refresh path, so it shares the dedup lock with a
+        request that hits a 403 while this is in flight: the request waits for
+        this attempt instead of launching a second browser.
+        """
+        client = self.client
+        if client is None or client.cf:
+            return
+        logger.info("Solving lucida's Cloudflare challenge with the browser")
+        try:
+            ok = await client._refresh_creds()
+        except Exception:
+            logger.exception("Cloudflare clearance acquisition crashed")
+            return
+        if ok:
+            logger.info("Cloudflare clearance acquired; lucida requests can proceed")
+        else:
+            logger.error(
+                "Could not acquire a Cloudflare clearance, so every lucida "
+                "request will be answered with a challenge. The reason is the "
+                "warning above; in a container this usually means the image "
+                "has no working Chromium or X display."
+            )
+
+    def clearance_state(self) -> Dict[str, Any]:
+        """Cloudflare state for /health."""
+        client = self.client
+        return {
+            "clearance": bool(client.cf) if client else False,
+            "last_error": self._clearance_error or None,
+        }
 
     async def close(self) -> None:
         client, self.client = self.client, None
@@ -713,8 +873,34 @@ class LucidaWrapper:
             response = await self.client._get(api.LUCIDA + "/search", params=params)
         except Exception as exc:
             logger.warning("lucida search request failed for %s: %s", service, exc)
+            self.last_search_error = f"request failed: {exc}"
             return None
-        return extract_data_node(response.text)
+
+        node = extract_data_node(response.text)
+        if node is None:
+            # Separate "the request never got through" from "lucida answered
+            # and said no": a Cloudflare challenge is HTTP 403 with no payload,
+            # and without naming it the only clue was "no data node".
+            detail = f"HTTP {response.status_code}"
+            body = response.text or ""
+            challenged = (
+                (response.headers.get("cf-mitigated") or "").lower() == "challenge"
+                or "Just a moment" in body
+                or "challenge-platform" in body
+            )
+            if challenged:
+                detail += (
+                    " from a Cloudflare challenge; the clearance cookie is "
+                    "missing or expired"
+                )
+                if self._clearance_error:
+                    detail += f" (clearance refresh failed: {self._clearance_error})"
+            logger.warning("lucida /search for %s (country=%r) carried no data "
+                           "node: %s", service, country, detail)
+            self.last_search_error = f"no data node in response ({detail})"
+        else:
+            self.last_search_error = ""
+        return node
 
     async def discover_countries(self, service: str) -> List[str]:
         """Learn which countries `service` accepts, from the live service.
@@ -732,9 +918,20 @@ class LucidaWrapper:
         node = await self.raw_search(name, "ZZ", PROBE_QUERY)
         codes = accepted_countries(node) if node else []
         if not codes:
-            logger.warning(
-                "could not read lucida's accepted countries for %s; using the "
-                "bootstrap value %r", name, BOOTSTRAP_COUNTRY.get(name, ""))
+            # An empty list is its own answer: lucida served a country select
+            # with nothing in it, which means the service has no accounts right
+            # now, and every country - including the bootstrap one - will be
+            # rejected. Say so instead of reporting a parse failure.
+            if node is None:
+                logger.warning(
+                    "could not read lucida's accepted countries for %s (no "
+                    "page data); using the bootstrap value %r",
+                    name, BOOTSTRAP_COUNTRY.get(name, ""))
+            else:
+                logger.warning(
+                    "lucida reports no available countries for %s right now, "
+                    "so it has no accounts to search with; the service is "
+                    "unavailable until it comes back", name)
             return []
 
         async with _country_lock:
@@ -771,11 +968,6 @@ class LucidaWrapper:
             if PATH_FALLBACK or not target.pinned
             else []
         )
-        # The pinned country is used as given, even when it is not the one
-        # discovery would have picked - it was asked for explicitly. Without
-        # one, fall back to whatever lucida says this service accepts.
-        country = target.country or service_country(configured)
-
         # Every failure is kept, not just the last one: reporting only the final
         # error credits whichever fallback hit a wall last, which points at the
         # wrong service whenever the configured one is the problem.
@@ -800,10 +992,22 @@ class LucidaWrapper:
             # cached, so a service only pays for discovery once. Only the pinned
             # service gets the pinned country; a fallback has to use its own.
             await self.discover_countries(service)
-            search_country = country if service == configured else service_country(service)
+            # The country is resolved AFTER discovery, not before the loop: on
+            # the first search of a process the bootstrap table is still
+            # unrefined, and using it made the configured service fail with a
+            # country that discovery had just proved wrong (qobuz: bootstrap
+            # GB, lucida reports NL) - a failure the fallback then papered over,
+            # so the search looked healthy while never using the service that
+            # was asked for. An explicit country from the path still wins, even
+            # when discovery would pick a different one; it was asked for.
+            if service == configured:
+                search_country = target.country or service_country(service)
+            else:
+                search_country = service_country(service)
             node = await self.raw_search(service, search_country, query)
             if node is None:
-                report(service, "no data node in response (Cloudflare challenge?)")
+                report(service, self.last_search_error
+                       or "no data node in response")
                 continue
             results = flatten_search(node)
             if results.get("error"):
@@ -1393,6 +1597,15 @@ async def health():
         "backend_service_known": resolved_service() in KNOWN_SERVICES,
         "known_services": list(KNOWN_SERVICES),
         "fallback_order": list(FALLBACK_SERVICES),
+        # Where a client can reach this proxy. "auto" means each request's own
+        # Host header is used, which is the default and the one value that
+        # cannot disagree with the address the client just used.
+        "proxy_base_url": PROXY_BASE_URL or "auto (from each request's Host)",
+        # Cloudflare state: whether lucida requests currently carry a clearance
+        # cookie, and why the last attempt to get one failed. A challenged
+        # lucida answers 403 for every service at once, so this explains a
+        # total search outage that no per-service error can.
+        "cloudflare": lucida.clearance_state(),
         # Whether a prefixed request may fall back. False means /qobuz is a hard
         # pin: it either answers from qobuz or reports why it could not.
         "path_fallback": PATH_FALLBACK,
@@ -1433,7 +1646,11 @@ if __name__ == "__main__":
 
     logger.info("Starting Lucida.to -> HiFi proxy on %s:%s", host, port)
     logger.info("API docs: http://%s:%s/docs", host, port)
-    logger.info("Clients must reach downloads at PROXY_BASE_URL=%s", PROXY_BASE_URL)
+    logger.info(
+        "Download URLs use %s",
+        f"PROXY_BASE_URL={PROXY_BASE_URL}" if PROXY_BASE_URL
+        else "the Host of each client request (PROXY_BASE_URL unset)",
+    )
     # Resolved here so an unrecognized service is reported at startup, before the
     # first search, rather than only as a warning once a search has already failed.
     logger.info(
@@ -1445,8 +1662,8 @@ if __name__ == "__main__":
     )
     logger.info("Requires: lucidadl installed, playwright + chromium (auto-installed if missing)")
     logger.info(
-        "Per-service URLs: %s/<service> and %s/<service>/<country> (e.g. %s/qobuz)",
-        PROXY_BASE_URL, PROXY_BASE_URL, PROXY_BASE_URL,
+        "Per-service URLs: <proxy>/<service> and <proxy>/<service>/<country> "
+        "(e.g. <proxy>/qobuz)"
     )
 
     uvicorn.run(app, host=host, port=port)

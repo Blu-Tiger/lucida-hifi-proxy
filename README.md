@@ -27,7 +27,7 @@ Read the code before trusting it with anything you care about.
 ```bash
 git clone https://github.com/Blu-Tiger/lucida-hifi-proxy.git
 cd lucida-hifi-proxy
-cp .env.example .env      # then set PROXY_BASE_URL (see below)
+cp .env.example .env      # every setting is optional; the defaults work as-is
 docker compose up -d      # pulls ghcr.io/blu-tiger/lucida-hifi-proxy:latest
 ```
 
@@ -51,17 +51,27 @@ docker compose pull && docker compose up -d   # move to the newest published ima
 docker build -t ghcr.io/blu-tiger/lucida-hifi-proxy:latest .   # or build your own
 ```
 
-### Setting `PROXY_BASE_URL`
+### `PROXY_BASE_URL` is usually best left empty
 
-The proxy embeds its own address in the manifest URLs it returns, so this value
-must be reachable **from SoulSync**:
+The proxy embeds its own address in the manifest URLs it returns, and takes
+that address from the **Host header of the request itself** unless
+`PROXY_BASE_URL` overrides it. A client can always reach the address it just
+used, so the default needs no configuration and cannot disagree with how
+SoulSync actually reaches the proxy.
 
-| SoulSync runs... | Set `PROXY_BASE_URL` to |
+An earlier revision pinned `http://host.docker.internal:8002` instead, which
+broke downloads *silently* whenever the client could not resolve it: the
+manifest was answered, and the download request it pointed at simply never
+arrived. Set the variable only when the Host header is not what clients should
+use (a reverse proxy, for instance), and give the address clients must reach:
+
+| Situation | `PROXY_BASE_URL` |
 | --- | --- |
-| on another machine | the LAN IP of this host, e.g. `http://192.168.1.3:8002` |
-| in Docker on this host | `http://host.docker.internal:8002` |
+| Default - any normal setup | leave empty |
+| Behind a reverse proxy | the public URL, e.g. `https://lucida.example.com` |
 
-Getting this wrong is the usual cause of "search works but downloads fail".
+If it is set and disagrees with an incoming request's Host, the proxy logs one
+warning naming both addresses.
 
 ### Pointing SoulSync at it
 
@@ -119,13 +129,14 @@ this README.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PROXY_BASE_URL` | `http://host.docker.internal:8002` | Address clients use to reach this proxy. |
+| `PROXY_BASE_URL` | *(empty = auto)* | Overrides the address embedded in manifest URLs. Empty uses the Host header of each request, which is by definition reachable from the client that made it. |
 | `LUCIDA_SERVICE` | `qobuz` | lucida.to service to search. The services lucida.to itself offers are `qobuz`, `tidal`, `soundcloud`, `deezer`, `amazon`, `yandex` and `grilledcheese` (there is no `spotify` — it has been removed). Any other value is tried first but reported as an error at startup and in `/health`. |
 | `LUCIDA_COUNTRY` | *(empty = auto)* | Country sent when fetching item pages and starting downloads. Empty sends the literal `auto`, letting lucida pick the account. Search never uses this; see below. |
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8002` | Bind address. |
 | `LUCIDA_USER_AGENT` | a Chrome UA | User agent used for lucida.to. |
 | `LUCIDA_PROBE_QUERY` | `test` | Query used to attach a real track to the client's probe id. |
 | `LUCIDA_PATH_FALLBACK` | *(off)* | Set to `1` to let a `/{service}` prefix fall back to another service. Off by default: a prefix is an explicit pin. The bare URL always falls back. |
+| `LUCIDA_CLEARANCE_COOLDOWN` | `60` | Seconds to wait before launching the browser again after a failed Cloudflare-clearance attempt, so a browser that cannot start is not relaunched on every challenged request. |
 | `DOWNLOAD_DIR` | `/data/downloads` | Where downloaded audio is cached. Used verbatim when set. |
 | `LUCIDADL_HOME` | `/data` | Cloudflare cookie + browser profile location. |`GET /health` reports the resolved `backend_service`, whether
 `backend_service_known` is true, the `known_services` list, the `fallback_order`,
@@ -164,7 +175,7 @@ Last measured from lucida's own `<select id="country">` (2026-10-01):
 
 | Service | Country |
 | --- | --- |
-| `qobuz` | `GB` (the only value it accepts) |
+| `qobuz` | `GB` on 2026-10-01, `NL` on 2026-10-02 — the only value each time |
 | `soundcloud`, `grilledcheese` | `XX` (lucida's own sentinel, labelled `Unknown country`) |
 | `amazon` | 48 countries; `US` is one, and omitting the parameter works |
 | `tidal`, `deezer` | none configured — every attempt is rejected |
@@ -172,7 +183,8 @@ Last measured from lucida's own `<select id="country">` (2026-10-01):
 
 `/data` is a volume in the compose file, so the Cloudflare clearance, browser
 profile and download cache survive restarts. Keeping the clearance is worth it:
-re-clearing Cloudflare takes 30–60 seconds.
+re-clearing Cloudflare takes 30–60 seconds, and the proxy loads the saved
+cookie at startup before it touches lucida.
 
 The two `/data` defaults above come from the image. Running
 `python lucida_hifi_proxy.py` directly falls back differently:
@@ -205,6 +217,36 @@ error, because lucida.to cannot back it. `/playback/requests/{id}` returns 404 �
 nothing is ever queued — and `/widevine` returns 501, since there is no DRM.
 FastAPI's interactive docs are at `/docs`.
 
+## Troubleshooting
+
+### Every search returns 502 and the logs show HTTP 403 from lucida.to
+
+That is Cloudflare, not lucida and not one service. A request with no valid
+`cf_clearance` cookie gets a *managed challenge* (HTTP 403 with
+`cf-mitigated: challenge`) for every service at once, which is why the error
+names each service with the same "no data node in response".
+
+The proxy handles it in three layers: it reuses the `cf_clearance` cookie
+lucidadl saved under `LUCIDADL_HOME` (`/data/clearance.json` in the container,
+which is on a volume); it solves the challenge with a browser when no cookie is
+saved or the cookie stops working; and it reports the failure at `WARNING` with
+the actual reason when neither works. Look for `Cloudflare clearance acquired`
+or `Cloudflare refresh failed: ...` in the logs, and check
+`GET /health` → `cloudflare` (`clearance: true`, plus the last `error`).
+
+If the refresh keeps failing in a container, the image's browser or its X
+display is the problem - the published image bundles both. `docker compose
+pull && docker compose up -d` moves to the current image; the clearance that
+solves the challenge then lives in the `lucida-data` volume and is reused on
+later restarts.
+
+### Search works but downloads never start
+
+SoulSync could not fetch the URL the manifest pointed at. Check that
+`PROXY_BASE_URL` is unset (see above) - a value the client cannot reach
+produces exactly this symptom, and it is invisible from the proxy because the
+download request never arrives.
+
 ## Known limitations
 
 These are real and reproduce; they are not hypothetical.
@@ -218,7 +260,9 @@ These are real and reproduce; they are not hypothetical.
   was never seen as an album row in `/search/` and so has no URL at all.
 - **Search depends on lucida.to's own service health, which changes.** Measured
   in one session: `qobuz` broke mid-session with an upstream 403 after working
-  repeatedly, `amazon` fails every search on a backend `ENOENT`,
+  repeatedly (the 403s turned out to be Cloudflare challenges - see
+  Troubleshooting), `amazon` failed every search on a backend `ENOENT` one day
+  and answered normally the next,
   `yandex` reports itself disabled, and `tidal`/`deezer` reject every country we
   could find. `grilledcheese` and `soundcloud` answered throughout. Because this
   moves, the proxy tries `LUCIDA_SERVICE`, then falls back, and returns
