@@ -1,0 +1,6 @@
+# entrypoint.sh runs under `sh` inside the container. On a Windows checkout with
+# core.autocrlf=true, Git would rewrite it to CRLF, and `sh` then dies with
+# "set: Illegal option -" before the proxy ever starts - which is exactly what
+# happened when building this image from a fresh `git archive` on Windows.
+# Force LF for it so a local build works on every platform.
+entrypoint.sh text eol=lf

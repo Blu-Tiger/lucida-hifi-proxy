@@ -240,6 +240,22 @@ pull && docker compose up -d` moves to the current image; the clearance that
 solves the challenge then lives in the `lucida-data` volume and is reused on
 later restarts.
 
+A failure whose reason is `BrowserType.launch_persistent_context: Target page,
+context or browser has been closed` is not Cloudflare alone: the browser died
+in a way that the X display or a stale lock in the volume could cause.
+
+If the last error says `no X display: Xvfb is not running`, the container was
+restarted or killed while Xvfb was running, and the entrypoint's stale-lock
+cleanup did not clear it - check the `entrypoint:` lines at the top of the
+logs. The message `the Chromium profile was locked by a previous run` means
+the container was killed while the browser was acquiring the clearance; the
+proxy removes those locks automatically before the next launch (look for
+`Removed N stale Chromium profile lock(s)`).
+
+A refresh failing twice within the cooldown shows as `browser refresh skipped:
+the previous attempt failed Ns ago`, which is normal - a retry happens after
+the 60s `LUCIDA_CLEARANCE_COOLDOWN` and the next request succeeds.
+
 ### Search works but downloads never start
 
 SoulSync could not fetch the URL the manifest pointed at. Check that
@@ -294,7 +310,7 @@ These are real and reproduce; they are not hypothetical.
   end-to-end.
 - **A container needs a virtual display.** lucida.to's Cloudflare check rejects a
   truly headless browser, so the image runs Chromium under Xvfb. Expect it to use
-  a few hundred MB of RAM. The image itself is ~400 MB compressed: Chromium and
+  a few hundred MB of RAM. The image itself is ~420 MB compressed: Chromium and
   its system libraries dominate, and Playwright's headless-shell build (which
   this proxy never launches) is deliberately left out of the image.
 - **The image is published under `:latest` with no versioned tags yet**, so a

@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import socket
 import tempfile
 import time
 from base64 import b64encode
@@ -57,6 +58,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lucidadl import api, utils
 from lucidadl.session import (
     LUCIDA,
+    USER_DATA_DIR,
     chromium_installed,
     get_page,
     install_chromium,
@@ -704,6 +706,82 @@ def _short_error(exc: Exception) -> str:
     return text.splitlines()[0][:300]
 
 
+def _browser_hint(exc: Exception) -> str:
+    """Name the real cause of a browser launch failure, from its full log.
+
+    Playwright's first line is generic ("Target page, context or browser has
+    been closed"); the cause sits further down, in the Browser logs section
+    that never reaches a one-line error. These are the two causes a container
+    hits, and both are fixed here (see clear_stale_profile_locks and
+    entrypoint.sh) - the hint is what remains if something else regresses.
+    """
+    text = str(exc)
+    if "Missing X server" in text or "XServer running" in text:
+        return " - no X display: Xvfb is not running (see the entrypoint logs)"
+    if "another computer" in text or "profile appears to be in use" in text:
+        return " - the Chromium profile was locked by a previous run"
+    return ""
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a local process with this pid exists. Never signals it."""
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # PROCESS_QUERY_LIMITED_INFORMATION; a live pid opens, a dead one
+            # does not. os.kill(pid, 0) is NOT usable here: on Windows Python
+            # implements it with TerminateProcess, i.e. it would kill the pid.
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def clear_stale_profile_locks() -> int:
+    """Delete Chromium's singleton locks left by a browser that did not exit.
+
+    A container killed while the browser is open leaves SingletonLock,
+    SingletonCookie and SingletonSocket on the volume. Chromium refuses to
+    open a profile whose lock names another host - and a recreated container
+    has a new hostname - so the next launch dies before Cloudflare is even
+    reached, with Playwright's generic "Target page, context or browser has
+    been closed".
+
+    Chromium's own ownership rule is replicated: SingletonLock points at
+    "<hostname>-<pid>" of the browser that owns the profile. A lock from
+    another host is unresolvable (and therefore stale here), and so is one
+    whose process is gone; only a live process on this host is a genuine
+    second browser (e.g. a lucidadl CLI run), which is left alone. Returns
+    the number of files removed.
+    """
+    profile = Path(USER_DATA_DIR)
+    lock = profile / "SingletonLock"
+    try:
+        target = os.readlink(lock) if lock.is_symlink() else ""
+    except OSError:
+        target = ""
+    if target.startswith(socket.gethostname() + "-"):
+        pid_part = target.rsplit("-", 1)[-1]
+        if pid_part.isdigit() and _pid_alive(int(pid_part)):
+            return 0
+    removed = 0
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (profile / name).unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 async def _click_turnstile(page: Any) -> bool:
     """Click Cloudflare's verification widget inside its own iframe.
 
@@ -761,6 +839,12 @@ async def acquire_clearance_with_click(hidden: bool = True) -> Any:
     cf_clearance + the user agent that solved it, persist both, close. The
     cookie is reused over httpx afterwards, so no browser stays open.
     """
+    removed = clear_stale_profile_locks()
+    if removed:
+        logger.info(
+            "Removed %d stale Chromium profile lock(s) before launching the "
+            "browser", removed
+        )
     async with lucida_context(hidden=hidden) as ctx:
         if not await ensure_cleared_with_click(ctx):
             raise RuntimeError("Cloudflare not cleared")
@@ -842,7 +926,7 @@ class LucidaWrapper:
                     creds = await acquire_clearance_with_click(hidden=True)
                 except Exception as exc:
                     self._clearance_failed_at = time.monotonic()
-                    self._clearance_error = _short_error(exc)
+                    self._clearance_error = _short_error(exc) + _browser_hint(exc)
                     raise
                 self._clearance_failed_at = 0.0
                 self._clearance_error = ""
